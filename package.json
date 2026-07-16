@@ -1,7 +1,7 @@
 {
-  "name": "agent-browser",
-  "version": "0.33.2",
-  "description": "Browser automation CLI for AI agents",
+  "name": "@divebell/agent-browser",
+  "version": "0.33.2-divebell.1",
+  "description": "Browser automation CLI for AI agents with Divebell memory diagnostics",
   "type": "module",
   "packageManager": "pnpm@11.1.3",
   "engines": {
@@ -39,16 +39,24 @@
     "chrome",
     "cdp",
     "cli",
-    "agent"
+    "agent",
+    "memory",
+    "diagnostics",
+    "openruntime"
   ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/agent-browser.git"
+    "url": "git+https://github.com/2heal1/agent-browser.git"
   },
   "bugs": {
-    "url": "https://github.com/vercel-labs/agent-browser/issues"
+    "url": "https://github.com/2heal1/agent-browser/issues"
   },
-  "homepage": "https://agent-browser.dev",
+  "homepage": "https://github.com/2heal1/agent-browser#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
   "devDependencies": {}
 }
