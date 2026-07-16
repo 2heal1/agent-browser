@@ -256,7 +256,7 @@ jobs:
           find artifacts -type f -name 'agent-browser-*' -exec mv -f {} bin/ \;
           chmod +x bin/agent-browser-* 2>/dev/null || true
 
-      - name: Verify package contents
+      - name: Verify assembled binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -280,15 +280,37 @@ jobs:
             fi
           done
 
+      - name: Pack package
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p package-artifacts
           pnpm pack --pack-destination package-artifacts
           TARBALL=$(find package-artifacts -maxdepth 1 -name '*.tgz' -print -quit)
           test -n "$TARBALL"
+          tar -tzf "$TARBALL" > package-artifacts/contents.txt
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
-          for binary in "${EXPECTED_BINARIES[@]}"; do
-            tar -tzf "$TARBALL" | grep -qx "package/bin/$binary"
-          done
+      - name: Verify packed binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r binary; do
+            grep -Fxq "package/bin/$binary" package-artifacts/contents.txt
+          done <<'EOF'
+          agent-browser-linux-x64
+          agent-browser-linux-arm64
+          agent-browser-linux-musl-x64
+          agent-browser-linux-musl-arm64
+          agent-browser-win32-x64.exe
+          agent-browser-darwin-x64
+          agent-browser-darwin-arm64
+          EOF
 
+      - name: Verify packed manifest
+        shell: bash
+        run: |
+          set -euo pipefail
           PACKED_NAME=$(tar -xOzf "$TARBALL" package/package.json | node -e \
             "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).name));")
           PACKED_VERSION=$(tar -xOzf "$TARBALL" package/package.json | node -e \
@@ -296,7 +318,6 @@ jobs:
 
           test "$PACKED_NAME" = "@openruntime/agent-browser"
           test "$PACKED_VERSION" = "${{ needs.validate.outputs.version }}"
-          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
       - name: Publish with npm trusted publishing
         run: pnpm publish "$TARBALL" --access public --provenance --no-git-checks
