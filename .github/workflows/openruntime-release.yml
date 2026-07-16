@@ -1,0 +1,303 @@
+name: Publish OpenRuntime agent-browser
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'openruntime-v*'
+
+concurrency:
+  group: openruntime-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Validate package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          REPOSITORY=$(node -p "require('./package.json').repository.url")
+          REGISTRY=$(node -p "require('./package.json').publishConfig.registry")
+
+          test "$NAME" = "@openruntime/agent-browser"
+          test "$REPOSITORY" = "git+https://github.com/2heal1/agent-browser.git"
+          test "$REGISTRY" = "https://registry.npmjs.org/"
+
+          case "$VERSION" in
+            *-openruntime.*) ;;
+            *)
+              echo "Version must use the -openruntime.N suffix: $VERSION"
+              exit 1
+              ;;
+          esac
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            EXPECTED_TAG="openruntime-v$VERSION"
+            if [ "${{ github.ref_name }}" != "$EXPECTED_TAG" ]; then
+              echo "Tag must be $EXPECTED_TAG"
+              exit 1
+            fi
+          fi
+
+          if pnpm view "$NAME@$VERSION" version --json >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already exists"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Validated $NAME@$VERSION"
+
+  build-binaries:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.28
+            binary: agent-browser-linux-x64
+            use_zigbuild: true
+          - name: Linux ARM64
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-gnu
+            build_target: aarch64-unknown-linux-gnu.2.28
+            binary: agent-browser-linux-arm64
+            use_zigbuild: true
+          - name: Linux musl x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            build_target: x86_64-unknown-linux-musl
+            binary: agent-browser-linux-musl-x64
+            use_zigbuild: true
+          - name: Linux musl ARM64
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-musl
+            build_target: aarch64-unknown-linux-musl
+            binary: agent-browser-linux-musl-arm64
+            use_zigbuild: true
+          - name: Windows x64
+            os: ubuntu-latest
+            rust_target: x86_64-pc-windows-gnu
+            build_target: x86_64-pc-windows-gnu
+            binary: agent-browser-win32-x64.exe
+            use_zigbuild: false
+          - name: macOS x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            build_target: x86_64-apple-darwin
+            binary: agent-browser-darwin-x64
+            use_zigbuild: false
+          - name: macOS ARM64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            build_target: aarch64-apple-darwin
+            binary: agent-browser-darwin-arm64
+            use_zigbuild: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version
+        run: pnpm run version:sync
+
+      - name: Build dashboard
+        run: pnpm --filter dashboard build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross-compilation tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu mingw-w64
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --version 0.22.3 --locked
+
+      - name: Configure Rust linkers
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+          EOF
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Build with zigbuild
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --manifest-path cli/Cargo.toml --target ${{ matrix.build_target }}
+
+      - name: Build with cargo
+        if: '!matrix.use_zigbuild'
+        run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.rust_target }}
+
+      - name: Copy binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "${{ matrix.rust_target }}" == *"windows"* ]]; then
+            cp cli/target/${{ matrix.rust_target }}/release/agent-browser.exe artifacts/${{ matrix.binary }}
+          else
+            cp cli/target/${{ matrix.rust_target }}/release/agent-browser artifacts/${{ matrix.binary }}
+            chmod +x artifacts/${{ matrix.binary }}
+          fi
+
+      - name: Verify Linux GNU glibc floor
+        if: matrix.binary == 'agent-browser-linux-x64' || matrix.binary == 'agent-browser-linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if objdump -p artifacts/${{ matrix.binary }} | grep -E 'GLIBC_2\.([3-9][0-9]|29)'; then
+            echo "${{ matrix.binary }} requires glibc newer than 2.28"
+            exit 1
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: artifacts/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish @openruntime/agent-browser
+    needs:
+      - validate
+      - build-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble package
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -type f -name 'agent-browser-*' -exec mv -f {} bin/ \;
+          chmod +x bin/agent-browser-* 2>/dev/null || true
+
+      - name: Verify package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_BINARIES=(
+            agent-browser-linux-x64
+            agent-browser-linux-arm64
+            agent-browser-linux-musl-x64
+            agent-browser-linux-musl-arm64
+            agent-browser-win32-x64.exe
+            agent-browser-darwin-x64
+            agent-browser-darwin-arm64
+          )
+
+          for binary in "${EXPECTED_BINARIES[@]}"; do
+            test -s "bin/$binary"
+            SIZE=$(stat -c%s "bin/$binary")
+            if [ "$SIZE" -lt 100000 ]; then
+              echo "bin/$binary is unexpectedly small: $SIZE bytes"
+              exit 1
+            fi
+          done
+
+          mkdir -p package-artifacts
+          pnpm pack --pack-destination package-artifacts
+          TARBALL=$(find package-artifacts -maxdepth 1 -name '*.tgz' -print -quit)
+          test -n "$TARBALL"
+
+          for binary in "${EXPECTED_BINARIES[@]}"; do
+            tar -tzf "$TARBALL" | grep -qx "package/bin/$binary"
+          done
+
+          PACKED_NAME=$(tar -xOzf "$TARBALL" package/package.json | node -e \
+            "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).name));")
+          PACKED_VERSION=$(tar -xOzf "$TARBALL" package/package.json | node -e \
+            "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).version));")
+
+          test "$PACKED_NAME" = "@openruntime/agent-browser"
+          test "$PACKED_VERSION" = "${{ needs.validate.outputs.version }}"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - name: Publish with npm trusted publishing
+        run: pnpm publish "$TARBALL" --access public --provenance --no-git-checks
