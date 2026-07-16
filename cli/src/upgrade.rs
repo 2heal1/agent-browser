@@ -3,7 +3,9 @@ use std::path::Path;
 use std::process::{exit, Command, Stdio};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/agent-browser/latest";
+const NPM_PACKAGE_NAME: &str = "@openruntime/agent-browser";
+const NPM_PACKAGE_LATEST: &str = "@openruntime/agent-browser@latest";
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@openruntime%2Fagent-browser/latest";
 
 enum InstallMethod {
     Npm,
@@ -81,8 +83,8 @@ fn detect_install_method() -> InstallMethod {
             return InstallMethod::Bun;
         }
 
-        if path_str.contains("node_modules/agent-browser")
-            || path_str.contains("node_modules\\agent-browser")
+        if path_str.contains("node_modules/@openruntime/agent-browser")
+            || path_str.contains("node_modules\\@openruntime\\agent-browser")
         {
             return InstallMethod::Npm;
         }
@@ -99,21 +101,21 @@ fn detect_install_method() -> InstallMethod {
 
     if command_output_contains(
         "pnpm",
-        &["list", "-g", "agent-browser", "--depth=0"],
-        "agent-browser",
+        &["list", "-g", NPM_PACKAGE_NAME, "--depth=0"],
+        NPM_PACKAGE_NAME,
     ) {
         return InstallMethod::Pnpm;
     }
 
-    if command_output_contains("yarn", &["global", "list", "--depth=0"], "agent-browser") {
+    if command_output_contains("yarn", &["global", "list", "--depth=0"], NPM_PACKAGE_NAME) {
         return InstallMethod::Yarn;
     }
 
-    if command_output_contains("bun", &["pm", "ls", "-g"], "agent-browser") {
+    if command_output_contains("bun", &["pm", "ls", "-g"], NPM_PACKAGE_NAME) {
         return InstallMethod::Bun;
     }
 
-    if command_succeeds("npm", &["list", "-g", "agent-browser", "--depth=0"]) {
+    if command_succeeds("npm", &["list", "-g", NPM_PACKAGE_NAME, "--depth=0"]) {
         return InstallMethod::Npm;
     }
 
@@ -143,25 +145,25 @@ fn run_upgrade_command(method: &InstallMethod) -> bool {
     let (cmd, args, display): (&str, &[&str], &str) = match method {
         InstallMethod::Npm => (
             "npm",
-            &["install", "-g", "agent-browser@latest"],
-            "npm install -g agent-browser@latest",
+            &["install", "-g", NPM_PACKAGE_LATEST],
+            "npm install -g @openruntime/agent-browser@latest",
         ),
         InstallMethod::Pnpm => (
             "pnpm",
-            &["add", "-g", "agent-browser@latest"],
-            "pnpm add -g agent-browser@latest",
+            &["add", "-g", NPM_PACKAGE_LATEST],
+            "pnpm add -g @openruntime/agent-browser@latest",
         ),
         // NOTE: `yarn global` is Yarn Classic (v1) only; Yarn Berry (v2+) removed it.
         // Users on Yarn v2+ won't reach this path — detection falls through to Unknown.
         InstallMethod::Yarn => (
             "yarn",
-            &["global", "add", "agent-browser@latest"],
-            "yarn global add agent-browser@latest",
+            &["global", "add", NPM_PACKAGE_LATEST],
+            "yarn global add @openruntime/agent-browser@latest",
         ),
         InstallMethod::Bun => (
             "bun",
-            &["install", "-g", "agent-browser@latest"],
-            "bun install -g agent-browser@latest",
+            &["install", "-g", NPM_PACKAGE_LATEST],
+            "bun install -g @openruntime/agent-browser@latest",
         ),
         InstallMethod::Homebrew => (
             "brew",
@@ -238,10 +240,10 @@ pub fn run_upgrade() {
             color::error_indicator()
         );
         eprintln!("  To update manually, run one of:");
-        eprintln!("    npm install -g agent-browser@latest       # npm");
-        eprintln!("    pnpm add -g agent-browser@latest          # pnpm");
-        eprintln!("    yarn global add agent-browser@latest       # yarn");
-        eprintln!("    bun install -g agent-browser@latest        # bun");
+        eprintln!("    npm install -g @openruntime/agent-browser@latest  # npm");
+        eprintln!("    pnpm add -g @openruntime/agent-browser@latest     # pnpm");
+        eprintln!("    yarn global add @openruntime/agent-browser@latest # yarn");
+        eprintln!("    bun install -g @openruntime/agent-browser@latest  # bun");
         eprintln!("    brew upgrade agent-browser                 # Homebrew");
         eprintln!("    cargo install agent-browser --force        # Cargo");
         exit(1);
