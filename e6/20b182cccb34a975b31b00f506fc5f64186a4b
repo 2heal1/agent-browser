@@ -1,0 +1,51 @@
+README.md
+  s_60f71aba1c63c2::t_fca99d710c955b 385-390,408-429
+cli/src/connection.rs
+  s_60f71aba1c63c2::t_8e294bbf267a86 38-39
+cli/src/main.rs
+  s_60f71aba1c63c2::t_9b1030f5c0923a 1180,1187,2132
+cli/src/mcp.rs
+  s_60f71aba1c63c2::t_454ca979a74034 107-113,263,415-421,1320-1379,2022-2023,2215-2221,2949-3000,3871-3877,4048-4059
+cli/src/native/cdp/client.rs
+  s_60f71aba1c63c2::t_3593acb8ad4394 211-229,258
+cli/src/native/daemon.rs
+  s_60f71aba1c63c2::t_1dda0bbe8abc66 19,190-193,218,220,248,266,313-316,341,343,371,388,404,453-477,600-651
+cli/src/native/memory.rs
+  s_60f71aba1c63c2::t_a3535d5a5f2be8 1-999
+cli/src/native/test_fixtures/memory_probe.html
+  s_60f71aba1c63c2::t_b02c82825cbb40 1-35
+docs/src/app/commands/page.mdx
+  s_60f71aba1c63c2::t_83eaf6dc8c92db 325-338
+docs/src/app/debugging/page.mdx
+  s_60f71aba1c63c2::t_f71d0b2eb8ebba 77
+docs/src/app/memory/layout.tsx
+  s_60f71aba1c63c2::t_c96dd12ea4a9f8 1-7
+docs/src/app/memory/page.mdx
+  s_60f71aba1c63c2::t_32af35df9259b8 1-91
+docs/src/lib/docs-navigation.ts
+  s_60f71aba1c63c2::t_482ce628e917d1 44
+docs/src/lib/page-titles.ts
+  s_60f71aba1c63c2::t_0bc2c5663a879f 21
+skill-data/core/SKILL.md
+  s_60f71aba1c63c2::t_0e29a8ff365597 354-368
+skill-data/core/references/commands.md
+  s_60f71aba1c63c2::t_0c91d9a87988b9 402-429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e620b182cccb34a975b31b00f506fc5f64186a4b",
+  "prompts": {},
+  "sessions": {
+    "s_60f71aba1c63c2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6069-eff0-7a92-8027-af58b0430a64",
+        "model": "unknown"
+      },
+      "human_author": "zhanghang.heal <zhanghang.heal@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
