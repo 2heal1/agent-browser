@@ -1,6 +1,6 @@
 # agent-browser
 
-Browser automation CLI for AI agents. This OpenRuntime build adds memory diagnostics and code coverage support.
+Browser automation CLI for AI agents. This Divebell build adds memory diagnostics and code coverage support.
 
 [![skills.sh](https://skills.sh/b/vercel-labs/agent-browser)](https://skills.sh/vercel-labs/agent-browser)
 
@@ -11,7 +11,7 @@ Browser automation CLI for AI agents. This OpenRuntime build adds memory diagnos
 Installs the native Rust binary:
 
 ```bash
-npm install -g @openruntime/agent-browser
+npm install -g @divebell/agent-browser
 agent-browser install  # Download Chrome from Chrome for Testing (first time only)
 ```
 
@@ -20,7 +20,7 @@ agent-browser install  # Download Chrome from Chrome for Testing (first time onl
 For projects that want to pin the version in `package.json`:
 
 ```bash
-npm install @openruntime/agent-browser
+npm install @divebell/agent-browser
 agent-browser install
 ```
 

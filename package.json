@@ -42,7 +42,7 @@
     "agent",
     "memory",
     "diagnostics",
-    "openruntime"
+    "divebell"
   ],
   "license": "Apache-2.0",
   "repository": {
