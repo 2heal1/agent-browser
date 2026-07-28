@@ -1,13 +1,13 @@
-name: Publish OpenRuntime agent-browser
+name: Publish Divebell agent-browser
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - 'openruntime-v*'
+      - 'divebell-v*'
 
 concurrency:
-  group: openruntime-release-${{ github.ref }}
+  group: divebell-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -43,20 +43,20 @@ jobs:
           REPOSITORY=$(node -p "require('./package.json').repository.url")
           REGISTRY=$(node -p "require('./package.json').publishConfig.registry")
 
-          test "$NAME" = "@openruntime/agent-browser"
+          test "$NAME" = "@divebell/agent-browser"
           test "$REPOSITORY" = "git+https://github.com/2heal1/agent-browser.git"
           test "$REGISTRY" = "https://registry.npmjs.org/"
 
           case "$VERSION" in
-            *-openruntime.*) ;;
+            *-divebell.*) ;;
             *)
-              echo "Version must use the -openruntime.N suffix: $VERSION"
+              echo "Version must use the -divebell.N suffix: $VERSION"
               exit 1
               ;;
           esac
 
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            EXPECTED_TAG="openruntime-v$VERSION"
+            EXPECTED_TAG="divebell-v$VERSION"
             if [ "${{ github.ref_name }}" != "$EXPECTED_TAG" ]; then
               echo "Tag must be $EXPECTED_TAG"
               exit 1
@@ -218,7 +218,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish @openruntime/agent-browser
+    name: Publish @divebell/agent-browser
     needs:
       - validate
       - build-binaries
@@ -316,7 +316,7 @@ jobs:
           PACKED_VERSION=$(tar -xOzf "$TARBALL" package/package.json | node -e \
             "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).version));")
 
-          test "$PACKED_NAME" = "@openruntime/agent-browser"
+          test "$PACKED_NAME" = "@divebell/agent-browser"
           test "$PACKED_VERSION" = "${{ needs.validate.outputs.version }}"
 
       - name: Publish with npm trusted publishing

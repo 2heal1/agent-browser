@@ -4037,7 +4037,7 @@ Environment:
   AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
 
 Install:
-  npm install -g @openruntime/agent-browser # npm
+  npm install -g @divebell/agent-browser # npm
   brew install agent-browser             # Homebrew
   cargo install agent-browser            # Cargo
   agent-browser install                  # Download Chrome (first time)
