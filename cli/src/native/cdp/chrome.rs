@@ -333,11 +333,7 @@ impl LaunchOptions {
     /// Extensions force headed mode because Chrome does not inject their
     /// content scripts under `--headless=new`.
     pub(crate) fn effectively_headless(&self) -> bool {
-        self.headless
-            && !self
-                .extensions
-                .as_ref()
-                .is_some_and(|exts| !exts.is_empty())
+        self.headless && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
     }
 }
 
@@ -541,7 +537,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
-        None => find_chrome().ok_or_else(|| {
+        None => find_chrome_for_mode(options.effectively_headless()).ok_or_else(|| {
             let cache_dir = crate::install::get_browsers_dir();
             format!(
                 "Chrome not found. Checked:\n  \
@@ -848,6 +844,10 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
 }
 
 pub fn find_chrome() -> Option<PathBuf> {
+    find_chrome_for_mode(true)
+}
+
+fn find_chrome_for_mode(allow_headless_shell: bool) -> Option<PathBuf> {
     // 1. Check Chrome downloaded by `agent-browser install`
     if let Some(p) = crate::install::find_installed_chrome() {
         return Some(p);
@@ -929,9 +929,16 @@ pub fn find_chrome() -> Option<PathBuf> {
         }
     }
 
-    // 3. Fallback: check Puppeteer / Playwright browser caches
+    // 3. Fallback: check Puppeteer / Playwright browser caches. Puppeteer
+    // installs chrome-headless-shell by default in many environments, so use
+    // it when a full Chrome-for-Testing download is unavailable.
     if let Some(p) = find_puppeteer_chrome() {
         return Some(p);
+    }
+    if allow_headless_shell {
+        if let Some(p) = find_puppeteer_headless_shell() {
+            return Some(p);
+        }
     }
     if let Some(p) = find_playwright_chromium() {
         return Some(p);
@@ -1399,26 +1406,47 @@ fn should_disable_dev_shm(existing_args: &[String]) -> bool {
 /// Search Puppeteer's browser cache for a Chrome binary.
 /// Puppeteer v19+ stores Chrome in ~/.cache/puppeteer/chrome/<platform>-<version>/
 fn find_puppeteer_chrome() -> Option<PathBuf> {
+    find_newest_puppeteer_binary("chrome", build_puppeteer_binary_path)
+}
+
+/// Search Puppeteer's cache for the standalone Chrome headless shell.
+fn find_puppeteer_headless_shell() -> Option<PathBuf> {
+    find_newest_puppeteer_binary("chrome-headless-shell", build_puppeteer_headless_shell_path)
+}
+
+fn find_newest_puppeteer_binary(
+    browser_dir: &str,
+    binary_path: fn(&Path) -> PathBuf,
+) -> Option<PathBuf> {
     let mut search_dirs = Vec::new();
 
     if let Ok(custom) = std::env::var("PUPPETEER_CACHE_DIR") {
-        search_dirs.push(PathBuf::from(custom).join("chrome"));
+        if !custom.is_empty() {
+            search_dirs.push(PathBuf::from(custom).join(browser_dir));
+        }
     }
 
     if let Some(home) = dirs::home_dir() {
-        search_dirs.push(home.join(".cache/puppeteer/chrome"));
+        search_dirs.push(home.join(".cache/puppeteer").join(browser_dir));
     }
 
-    for dir in &search_dirs {
+    find_newest_binary_in_dirs(search_dirs, binary_path)
+}
+
+fn find_newest_binary_in_dirs(
+    search_dirs: Vec<PathBuf>,
+    binary_path: fn(&Path) -> PathBuf,
+) -> Option<PathBuf> {
+    for dir in search_dirs {
         if !dir.is_dir() {
             continue;
         }
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
             let mut matches: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| {
-                    let candidate = build_puppeteer_binary_path(&e.path());
+                    let candidate = binary_path(&e.path());
                     if candidate.exists() {
                         Some(candidate)
                     } else {
@@ -1464,6 +1492,30 @@ fn build_puppeteer_binary_path(version_dir: &Path) -> PathBuf {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn build_puppeteer_binary_path(version_dir: &Path) -> PathBuf {
     version_dir.join("chrome")
+}
+
+#[cfg(target_os = "linux")]
+fn build_puppeteer_headless_shell_path(version_dir: &Path) -> PathBuf {
+    version_dir.join("chrome-headless-shell-linux64/chrome-headless-shell")
+}
+
+#[cfg(target_os = "macos")]
+fn build_puppeteer_headless_shell_path(version_dir: &Path) -> PathBuf {
+    let arm = version_dir.join("chrome-headless-shell-mac-arm64/chrome-headless-shell");
+    if arm.exists() {
+        return arm;
+    }
+    version_dir.join("chrome-headless-shell-mac-x64/chrome-headless-shell")
+}
+
+#[cfg(target_os = "windows")]
+fn build_puppeteer_headless_shell_path(version_dir: &Path) -> PathBuf {
+    version_dir.join(r"chrome-headless-shell-win64\chrome-headless-shell.exe")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn build_puppeteer_headless_shell_path(version_dir: &Path) -> PathBuf {
+    version_dir.join("chrome-headless-shell")
 }
 
 /// Search Playwright's browser cache for a Chromium binary.
@@ -1583,6 +1635,26 @@ mod tests {
                 assert!(path.exists());
             }
         }
+    }
+
+    #[test]
+    fn test_finds_newest_puppeteer_headless_shell() {
+        let cache = tempfile::tempdir().unwrap();
+        let older = cache.path().join("chrome-headless-shell").join("test-100");
+        let newer = cache.path().join("chrome-headless-shell").join("test-200");
+        let older_binary = build_puppeteer_headless_shell_path(&older);
+        let newer_binary = build_puppeteer_headless_shell_path(&newer);
+        std::fs::create_dir_all(older_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(newer_binary.parent().unwrap()).unwrap();
+        std::fs::write(&older_binary, "older").unwrap();
+        std::fs::write(&newer_binary, "newer").unwrap();
+
+        let found = find_newest_binary_in_dirs(
+            vec![cache.path().join("chrome-headless-shell")],
+            build_puppeteer_headless_shell_path,
+        );
+
+        assert_eq!(found, Some(newer_binary));
     }
 
     #[test]

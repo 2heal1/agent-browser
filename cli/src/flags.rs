@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CONFIG_DIR: &str = ".agent-browser";
 const CONFIG_FILENAME: &str = "config.json";
 const PROJECT_CONFIG_FILENAME: &str = "agent-browser.json";
 
@@ -309,9 +308,7 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
             .ok_or_else(|| format!("failed to load config from {}", path_str));
     }
 
-    let user_config = dirs::home_dir()
-        .map(|d| d.join(CONFIG_DIR).join(CONFIG_FILENAME))
-        .and_then(|p| read_config_file(&p))
+    let user_config = read_config_file(&crate::paths::agent_browser_home().join(CONFIG_FILENAME))
         .unwrap_or_default();
 
     let project_config = read_config_file(&PathBuf::from(PROJECT_CONFIG_FILENAME));

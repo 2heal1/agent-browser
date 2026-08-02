@@ -1776,7 +1776,7 @@ fn parity_tools() -> Vec<Value> {
                 "reference": { "type": "string", "description": "npm package, scoped package, or owner/repo GitHub reference." },
                 "name": { "type": "string", "description": "Override the configured plugin name." },
                 "capabilities": string_array_schema("Capabilities to declare when manifest discovery is skipped or unavailable."),
-                "global": { "type": "boolean", "default": false, "description": "Write ~/.agent-browser/config.json instead of ./agent-browser.json." },
+                "global": { "type": "boolean", "default": false, "description": "Write the user config under AGENT_BROWSER_HOME (normally ~/.agent-browser/config.json) instead of ./agent-browser.json." },
                 "noManifest": { "type": "boolean", "default": false, "description": "Skip plugin.manifest discovery." }
             }),
             &["reference"],

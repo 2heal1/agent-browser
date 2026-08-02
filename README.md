@@ -1043,7 +1043,7 @@ Create an `agent-browser.json` file to set persistent defaults instead of repeat
 
 **Locations (lowest to highest priority):**
 
-1. `~/.agent-browser/config.json`: user-level defaults
+1. `~/.agent-browser/config.json`: user-level defaults (or `$AGENT_BROWSER_HOME/config.json`)
 2. `./agent-browser.json`: project-level overrides (in working directory)
 3. `AGENT_BROWSER_*` environment variables override config file values
 4. CLI flags override everything
@@ -1074,6 +1074,15 @@ Use `--config <path>` or `AGENT_BROWSER_CONFIG` to load a specific config file i
 agent-browser --config ./ci-config.json open example.com
 AGENT_BROWSER_CONFIG=./ci-config.json agent-browser open example.com
 ```
+
+For sandboxed agents whose home directory is read-only, set
+`AGENT_BROWSER_HOME` to a writable directory such as `/tmp/agent-browser`.
+This relocates agent-browser-owned configuration, session state, browser
+downloads, temporary artifacts, and daemon files without changing `HOME` for
+other tools. When no override is set and `~/.agent-browser` is not writable,
+agent-browser automatically uses a short per-user directory under `/tmp` on
+Unix. Sandboxes that prohibit local sockets or browser processes entirely
+still require a browser running outside the sandbox and a reachable CDP URL.
 
 All options from the table above can be set in the config file using camelCase keys (e.g., `--executable-path` becomes `"executablePath"`, `--proxy-bypass` becomes `"proxyBypass"`). Plugins are configured with the `"plugins"` array shown above. Unknown keys are ignored for forward compatibility.
 

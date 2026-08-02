@@ -43,11 +43,7 @@ fn validate_profile_name(name: &str) -> Result<(), String> {
 }
 
 fn get_auth_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("auth")
-    } else {
-        std::env::temp_dir().join("agent-browser").join("auth")
-    }
+    crate::paths::agent_browser_home().join("auth")
 }
 
 fn get_profile_path(name: &str) -> PathBuf {
@@ -58,11 +54,7 @@ const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
 const KEY_FILE_NAME: &str = ".encryption-key";
 
 fn get_agent_browser_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
-    } else {
-        std::env::temp_dir().join("agent-browser")
-    }
+    crate::paths::agent_browser_home()
 }
 
 fn get_key_file_path() -> PathBuf {
@@ -81,7 +73,7 @@ fn parse_key_hex(hex_str: &str) -> Option<Vec<u8>> {
 }
 
 /// Read the encryption key from AGENT_BROWSER_ENCRYPTION_KEY env var or
-/// ~/.agent-browser/.encryption-key file (matching the Node.js implementation).
+/// $AGENT_BROWSER_HOME/.encryption-key file (normally ~/.agent-browser).
 fn get_encryption_key() -> Result<Vec<u8>, String> {
     if let Ok(key_hex) = std::env::var(ENCRYPTION_KEY_ENV) {
         return parse_key_hex(&key_hex).ok_or_else(|| {

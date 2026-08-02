@@ -3581,6 +3581,7 @@ Full parity config example:
 
 Environment:
   AGENT_BROWSER_SESSION          Default browser session
+  AGENT_BROWSER_HOME             Agent-browser config, state, cache, and daemon directory
   AGENT_BROWSER_SOCKET_DIR       Daemon socket directory
   AGENT_BROWSER_CONFIG           Config file loaded by tool invocations
 "##
@@ -3645,7 +3646,7 @@ Add sources:
 Add options:
   --name <name>            Override the configured plugin name
   --capability <name>      Declare a capability if the plugin has no manifest
-  --global                 Write ~/.agent-browser/config.json instead of ./agent-browser.json
+  --global                 Write user config under AGENT_BROWSER_HOME instead of ./agent-browser.json
   --no-manifest            Skip plugin.manifest discovery
 
 plugin add asks the package for plugin.manifest to discover name and
@@ -3953,7 +3954,7 @@ Options:
 
 Configuration:
   agent-browser looks for agent-browser.json in these locations (lowest to highest priority):
-    1. ~/.agent-browser/config.json      User-level defaults
+    1. $AGENT_BROWSER_HOME/config.json   User-level defaults (normally ~/.agent-browser)
     2. ./agent-browser.json              Project-level overrides
     3. Environment variables             Override config file values
     4. CLI flags                         Override everything

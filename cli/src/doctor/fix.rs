@@ -211,9 +211,10 @@ mod tests {
         // Reaches the Info-status arm in run_fixes that was previously
         // unreachable due to an early-continue guard. Overrides HOME so
         // get_state_dir() resolves under a temp dir.
-        let guard = crate::test_utils::EnvGuard::new(&["HOME"]);
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_HOME"]);
         let tmp = TempDir::new().unwrap();
         guard.set("HOME", tmp.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_HOME");
 
         let mut checks = vec![Check::new(
             "security.encryption_key",
