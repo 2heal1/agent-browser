@@ -428,6 +428,11 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Effective built-in features and user scripts used by the active browser.
+    /// Partial follow-up launch requests inherit these values instead of
+    /// accidentally replacing them with empty lists and relaunching.
+    active_enable_features: Vec<String>,
+    active_init_script_paths: Vec<String>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
     network_auto_attach_installed: bool,
@@ -527,6 +532,8 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            active_enable_features: Vec::new(),
+            active_init_script_paths: Vec::new(),
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             // README documents 25s, intentionally below the CLI's 30s IPC
@@ -2015,6 +2022,8 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 
     close_active_provider_session(state).await;
     state.launch_hash = None;
+    state.active_enable_features.clear();
+    state.active_init_script_paths.clear();
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
     state.active_iframe_sessions.clear();
@@ -3371,27 +3380,20 @@ async fn auto_launch(
 /// Also evaluates each script on the current page (if any) so the effect is
 /// immediate for already-loaded pages.
 fn launch_enable_features_from_env() -> Vec<String> {
-    env::var("AGENT_BROWSER_ENABLE")
-        .ok()
-        .map(|raw| {
-            raw.split([',', '\n'])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    launch_string_array_from_env("AGENT_BROWSER_ENABLE").unwrap_or_default()
 }
 
 fn launch_init_script_paths_from_env() -> Vec<String> {
-    env::var("AGENT_BROWSER_INIT_SCRIPTS")
-        .ok()
-        .map(|raw| {
-            raw.split([',', '\n'])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    launch_string_array_from_env("AGENT_BROWSER_INIT_SCRIPTS").unwrap_or_default()
+}
+
+fn launch_string_array_from_env(name: &str) -> Option<Vec<String>> {
+    env::var(name).ok().map(|raw| {
+        raw.split([',', '\n'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
 }
 
 fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
@@ -3400,6 +3402,16 @@ fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect()
     })
+}
+
+fn resolve_launch_string_array(
+    command_value: Option<Vec<String>>,
+    env_value: Option<Vec<String>>,
+    active_value: &[String],
+) -> Vec<String> {
+    command_value
+        .or(env_value)
+        .unwrap_or_else(|| active_value.to_vec())
 }
 
 fn allowed_domains_from_launch_command(cmd: &Value) -> Option<Vec<String>> {
@@ -3419,7 +3431,7 @@ fn allowed_domains_from_launch_command(cmd: &Value) -> Option<Vec<String>> {
 }
 
 async fn apply_launch_init_scripts(
-    state: &DaemonState,
+    state: &mut DaemonState,
     enable_features: &[String],
     init_script_paths: &[String],
 ) {
@@ -3452,6 +3464,9 @@ async fn apply_launch_init_scripts(
     for source in &state.plugin_init_scripts {
         let _ = mgr.add_script_to_evaluate(source).await;
     }
+
+    state.active_enable_features = enable_features.to_vec();
+    state.active_init_script_paths = init_script_paths.to_vec();
 }
 
 async fn apply_launch_mutator_plugins(
@@ -3885,10 +3900,16 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
-    let enable_features =
-        string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
-    let init_script_paths = string_array_from_command(cmd, "initScripts")
-        .unwrap_or_else(launch_init_script_paths_from_env);
+    let enable_features = resolve_launch_string_array(
+        string_array_from_command(cmd, "enable"),
+        launch_string_array_from_env("AGENT_BROWSER_ENABLE"),
+        &state.active_enable_features,
+    );
+    let init_script_paths = resolve_launch_string_array(
+        string_array_from_command(cmd, "initScripts"),
+        launch_string_array_from_env("AGENT_BROWSER_INIT_SCRIPTS"),
+        &state.active_init_script_paths,
+    );
 
     let extensions: Option<Vec<String>> =
         cmd.get("extensions").and_then(|v| v.as_array()).map(|arr| {
@@ -6862,11 +6883,7 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let save_path = match path {
         Some(p) => p.to_string(),
         None => {
-            let dir = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".agent-browser")
-                .join("tmp")
-                .join("pdfs");
+            let dir = crate::paths::agent_browser_home().join("tmp").join("pdfs");
             let _ = std::fs::create_dir_all(&dir);
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -9950,11 +9967,7 @@ fn har_output_path(explicit_path: Option<&str>) -> String {
 }
 
 fn get_har_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("tmp").join("har")
-    } else {
-        std::env::temp_dir().join("agent-browser").join("har")
-    }
+    crate::paths::agent_browser_home().join("tmp").join("har")
 }
 
 fn unix_timestamp_millis() -> u128 {
@@ -13129,6 +13142,28 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(!opts.allow_file_access);
         assert!(opts.hide_scrollbars);
         assert!(!opts.restrict_webrtc);
+    }
+
+    #[test]
+    fn test_partial_launch_inherits_active_script_configuration() {
+        let active = vec!["/tmp/divebell-init.js".to_string()];
+        assert_eq!(resolve_launch_string_array(None, None, &active), active);
+    }
+
+    #[test]
+    fn test_explicit_empty_launch_script_configuration_clears_active_value() {
+        let active = vec!["/tmp/divebell-init.js".to_string()];
+        assert!(resolve_launch_string_array(Some(Vec::new()), None, &active).is_empty());
+    }
+
+    #[test]
+    fn test_environment_launch_script_configuration_overrides_active_value() {
+        let active = vec!["/tmp/old.js".to_string()];
+        let from_env = vec!["/tmp/new.js".to_string()];
+        assert_eq!(
+            resolve_launch_string_array(None, Some(from_env.clone()), &active),
+            from_env
+        );
     }
 
     #[test]

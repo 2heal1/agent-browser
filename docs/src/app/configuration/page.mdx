@@ -238,6 +238,7 @@ These environment variables configure additional daemon and runtime behavior:
   </thead>
   <tbody>
     <tr><td><code>AGENT_BROWSER_CONFIG</code></td><td>Path to an explicit config file.</td><td>(default discovery)</td></tr>
+    <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Relocate agent-browser-owned config, state, browser downloads, temporary artifacts, and daemon files. Useful when the OS home is read-only in a sandbox.</td><td>writable <code>~/.agent-browser</code>, otherwise a short per-user temp directory</td></tr>
     <tr><td><code>AGENT_BROWSER_SESSION</code></td><td>Isolated browser session name.</td><td><code>default</code></td></tr>
     <tr><td><code>AGENT_BROWSER_AUTO_CONNECT</code></td><td>Auto-discover and connect to a running Chrome instance.</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_ALLOW_FILE_ACCESS</code></td><td>Allow <code>file://</code> URLs to access local files.</td><td>(disabled)</td></tr>
@@ -296,7 +297,7 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td>(temp directory)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_QUALITY</code></td><td>JPEG screenshot quality from 0 to 100.</td><td>(format default)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_FORMAT</code></td><td>Screenshot format: <code>png</code> or <code>jpeg</code>.</td><td><code>png</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or <code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files. Takes precedence over <code>AGENT_BROWSER_HOME</code>.</td><td>runtime dir or agent-browser home</td></tr>
     <tr><td><code>AGENT_BROWSER_SKILLS_DIR</code></td><td>Override the directory used by <code>agent-browser skills</code>.</td><td>bundled skills</td></tr>
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>

@@ -95,38 +95,20 @@ impl Connection {
 }
 
 /// Get the base directory for socket/pid files.
-/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
+/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > AGENT_BROWSER_HOME
+/// > writable ~/.agent-browser > short per-user temporary directory.
 pub fn get_socket_dir() -> PathBuf {
-    // 1. Explicit override (ignore empty string)
-    let base = if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
-        if !dir.is_empty() {
-            PathBuf::from(dir)
-        } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-            if !runtime_dir.is_empty() {
-                PathBuf::from(runtime_dir).join("agent-browser")
-            } else if let Some(home) = dirs::home_dir() {
-                home.join(".agent-browser")
-            } else {
-                env::temp_dir().join("agent-browser")
-            }
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
-        }
-    } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            PathBuf::from(runtime_dir).join("agent-browser")
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
-        }
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
-    } else {
-        env::temp_dir().join("agent-browser")
-    };
+    let base = env::var("AGENT_BROWSER_SOCKET_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("XDG_RUNTIME_DIR")
+                .ok()
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| PathBuf::from(dir).join("agent-browser"))
+        })
+        .unwrap_or_else(crate::paths::agent_browser_home);
 
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
@@ -1131,15 +1113,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_socket_dir_uses_agent_browser_home() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_HOME",
+        ]);
+        guard.remove("AGENT_BROWSER_SOCKET_DIR");
+        guard.remove("XDG_RUNTIME_DIR");
+        guard.set("AGENT_BROWSER_HOME", "/tmp/custom-agent-browser-home");
+
+        assert_eq!(
+            get_socket_dir(),
+            PathBuf::from("/tmp/custom-agent-browser-home")
+        );
+    }
+
+    #[test]
     fn test_get_socket_dir_ignores_empty_socket_dir() {
         let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
         _guard.remove("XDG_RUNTIME_DIR");
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        let result = get_socket_dir();
+        assert!(
+            result.to_string_lossy().ends_with(".agent-browser")
+                || result.to_string_lossy().contains("/tmp/agent-browser-")
+        );
     }
 
     #[test]
@@ -1162,9 +1163,11 @@ mod tests {
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
         _guard.set("XDG_RUNTIME_DIR", "");
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        let result = get_socket_dir();
+        assert!(
+            result.to_string_lossy().ends_with(".agent-browser")
+                || result.to_string_lossy().contains("/tmp/agent-browser-")
+        );
     }
 
     #[test]
@@ -1175,9 +1178,9 @@ mod tests {
         _guard.remove("XDG_RUNTIME_DIR");
 
         let result = get_socket_dir();
-        assert!(result.to_string_lossy().ends_with(".agent-browser"));
         assert!(
-            result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
+            result.to_string_lossy().ends_with(".agent-browser")
+                || result.to_string_lossy().contains("/tmp/agent-browser-")
         );
     }
 

@@ -8,6 +8,7 @@ mod install;
 mod mcp;
 mod native;
 mod output;
+mod paths;
 mod plugins;
 mod read;
 mod skills;

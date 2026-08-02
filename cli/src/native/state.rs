@@ -822,15 +822,11 @@ pub fn dispatch_state_command(cmd: &Value) -> Option<Result<Value, String>> {
     }
 }
 
-/// Return the agent-browser state root (`~/.agent-browser`, falling back to
-/// `<tempdir>/agent-browser` when the home directory can't be resolved).
+/// Return the agent-browser state root. `AGENT_BROWSER_HOME` can relocate it;
+/// otherwise an unwritable OS home falls back to a short per-user temp path.
 /// This is the parent of `sessions/`, auth storage, and the encryption key.
 pub fn get_state_dir() -> PathBuf {
-    let base = if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
-    } else {
-        std::env::temp_dir().join("agent-browser")
-    };
+    let base = crate::paths::agent_browser_home();
 
     if let Ok(namespace) = std::env::var("AGENT_BROWSER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
@@ -963,11 +959,13 @@ mod tests {
 
     #[test]
     fn test_get_state_dir_namespace_scopes_sessions() {
-        let _guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+        let _guard =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
+        _guard.set("AGENT_BROWSER_HOME", "/tmp/agent-browser-state-test");
         _guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
 
         let dir = get_state_dir();
-        let expected_state_suffix = PathBuf::from(".agent-browser")
+        let expected_state_suffix = PathBuf::from("/tmp/agent-browser-state-test")
             .join("namespaces")
             .join("worktree-one")
             .join("state");
