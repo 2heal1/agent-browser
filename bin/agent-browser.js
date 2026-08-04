@@ -3,9 +3,8 @@
 /**
  * Cross-platform CLI wrapper for agent-browser
  * 
- * This wrapper enables npx support on Windows where shell scripts don't work.
- * For global installs, postinstall.js patches the shims to invoke the native
- * binary directly (zero overhead).
+ * This wrapper enables npx support on Windows where shell scripts don't work
+ * and selects the bundled native binary for the current platform.
  */
 
 import { spawn, execSync } from 'child_process';
@@ -80,12 +79,12 @@ function main() {
     console.error(`Expected: ${binaryPath}`);
     console.error('');
     console.error('Run "npm run build:native" to build for your platform,');
-    console.error('or reinstall the package to trigger the postinstall download.');
+    console.error('or reinstall the package to restore its bundled binaries.');
     process.exit(1);
   }
 
-  // Ensure binary is executable (fixes EACCES on macOS/Linux when postinstall didn't run,
-  // e.g., when using bun which blocks lifecycle scripts by default)
+  // Ensure the bundled binary is executable even when a package manager does
+  // not preserve its mode.
   if (platform() !== 'win32') {
     try {
       accessSync(binaryPath, constants.X_OK);
