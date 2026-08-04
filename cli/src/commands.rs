@@ -1758,9 +1758,36 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 Some("save") => {
                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "state save".to_string(),
-                        usage: "state save <path>",
+                        usage: "state save <path> [--include-origin <url>]...",
                     })?;
-                    Ok(json!({ "id": id, "action": "state_save", "path": path }))
+                    let mut included_origins = Vec::new();
+                    let mut index = 2;
+                    while index < rest.len() {
+                        match rest[index] {
+                            "--include-origin" => {
+                                let origin = rest
+                                    .get(index + 1)
+                                    .filter(|value| !value.starts_with('-'))
+                                    .ok_or_else(|| ParseError::MissingArguments {
+                                        context: "state save --include-origin".to_string(),
+                                        usage: "state save <path> [--include-origin <url>]...",
+                                    })?;
+                                included_origins.push(*origin);
+                                index += 2;
+                            }
+                            option => {
+                                return Err(ParseError::InvalidValue {
+                                    message: format!("Unknown state save option '{}'", option),
+                                    usage: "state save <path> [--include-origin <url>]...",
+                                });
+                            }
+                        }
+                    }
+                    let mut cmd = json!({ "id": id, "action": "state_save", "path": path });
+                    if !included_origins.is_empty() {
+                        cmd["includeOrigins"] = json!(included_origins);
+                    }
+                    Ok(cmd)
                 }
                 Some("load") => {
                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -3524,6 +3551,40 @@ mod tests {
     fn test_cookies_clear() {
         let cmd = parse_command(&args("cookies clear"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "cookies_clear");
+    }
+
+    #[test]
+    fn test_state_save_collects_repeated_include_origins() {
+        let cmd = parse_command(
+            &args(
+                "state save auth.json --include-origin https://sso.example.com/login --include-origin https://accounts.example.net",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+
+        assert_eq!(cmd["action"], "state_save");
+        assert_eq!(cmd["path"], "auth.json");
+        assert_eq!(
+            cmd["includeOrigins"],
+            json!([
+                "https://sso.example.com/login",
+                "https://accounts.example.net"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_state_save_include_origin_requires_value() {
+        let result = parse_command(
+            &args("state save auth.json --include-origin"),
+            &default_flags(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParseError::MissingArguments { context, .. })
+                if context == "state save --include-origin"
+        ));
     }
 
     #[test]

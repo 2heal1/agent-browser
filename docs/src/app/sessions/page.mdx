@@ -114,6 +114,14 @@ Log in to your target site(s) in this Chrome window.
 agent-browser --auto-connect state save ./my-auth.json
 ```
 
+State files preserve HTTP-only and partitioned cookie metadata. Cookies are collected for the whole browser session. Repeat `--include-origin` when an authentication origin has localStorage that the active agent-browser session did not visit:
+
+```bash
+agent-browser --auto-connect state save ./my-auth.json \
+  --include-origin https://sso.example.com \
+  --include-origin https://accounts.example.net
+```
+
 **Step 3:** Use the saved auth in future sessions:
 
 ```bash
@@ -219,7 +227,7 @@ agent-browser state clear my-session
 agent-browser state clear --all
 
 # Manual save/load (for custom paths)
-agent-browser state save ./backup.json
+agent-browser state save ./backup.json --include-origin https://sso.example.com
 agent-browser state load ./backup.json
 ```
 

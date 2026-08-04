@@ -3007,7 +3007,8 @@ Usage: agent-browser state <operation> [args]
 Save, restore, list, and manage browser state (cookies, localStorage, sessionStorage).
 
 Operations:
-  save <path>                        Save current state to file
+  save <path> [--include-origin <url>]...
+                                     Save state and collect additional origins
   load <path>                        Load state from file
   list                               List saved state files
   show <filename>                    Show state summary
@@ -3030,6 +3031,7 @@ Global Options:
 
 Examples:
   agent-browser state save ./auth-state.json
+  agent-browser state save ./sso-state.json --include-origin https://sso.example.com
   agent-browser state load ./auth-state.json
   agent-browser state list
   agent-browser state show myapp-default.json

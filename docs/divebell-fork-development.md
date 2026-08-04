@@ -67,6 +67,12 @@ Do not put unrelated product changes directly on the release branch. Keeping
 each feature separate makes upstream rebases, reviews, and later removal of
 fork-only patches predictable.
 
+## Maintained fork change record
+
+Changes listed here are carried by the Divebell release branch until they are available in an official agent-browser release.
+
+- **Portable SSO state, pending release:** Auth state preserves CDP cookie priority, source, port, and partition metadata. `state save --include-origin <url>` is repeatable across the CLI and MCP so known authentication origins can contribute localStorage even when the active browser session did not navigate through them.
+
 ## Publishing the Divebell package
 
 The published npm package is `@divebell/agent-browser`. Its version tracks the

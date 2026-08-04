@@ -324,7 +324,7 @@ Other capabilities use the same protocol:
 ## State Management
 
 ```bash
-agent-browser state save auth.json    # Save cookies, storage, auth state
+agent-browser state save auth.json [--include-origin <url>]...  # Save cookies and storage
 agent-browser state load auth.json    # Restore saved state
 ```
 

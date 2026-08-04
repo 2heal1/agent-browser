@@ -22,6 +22,41 @@ pub struct Cookie {
     pub session: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_port: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<CookiePartitionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key_opaque: Option<bool>,
+}
+
+/// Serializable partition metadata returned by CDP for CHIPS cookies.
+///
+/// State files keep this metadata so a later `Network.setCookies` call can
+/// recreate the cookie in the same top-level site partition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CookiePartitionKey {
+    pub top_level_site: String,
+    pub has_cross_site_ancestor: bool,
+}
+
+impl Cookie {
+    /// Convert the cookie returned by `Network.getAllCookies` into the subset
+    /// accepted by `Network.setCookies` while retaining restorable metadata.
+    pub fn to_set_cookie_value(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Some(cookie) = value.as_object_mut() {
+            cookie.remove("size");
+            cookie.remove("session");
+            cookie.remove("partitionKeyOpaque");
+        }
+        value
+    }
 }
 
 pub async fn get_all_cookies(client: &CdpClient, session_id: &str) -> Result<Vec<Cookie>, String> {

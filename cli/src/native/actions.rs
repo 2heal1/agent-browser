@@ -5795,6 +5795,19 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let path = cmd.get("path").and_then(|v| v.as_str());
+    let included_origins = match cmd.get("includeOrigins") {
+        Some(Value::Array(origins)) => origins
+            .iter()
+            .map(|origin| {
+                origin
+                    .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| "includeOrigins must contain only strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("includeOrigins must be an array".to_string()),
+        None => Vec::new(),
+    };
 
     let saved_path = state::save_state(
         &mgr.client,
@@ -5803,6 +5816,7 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
         state.session_name.as_deref(),
         &state.session_id,
         mgr.visited_origins(),
+        &included_origins,
     )
     .await?;
 

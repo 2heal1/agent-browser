@@ -56,6 +56,29 @@ fn collect_frame_origins(tree: &Value, origins: &mut HashSet<String>) {
     }
 }
 
+fn normalize_included_origin(input: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(input).map_err(|_| {
+        format!(
+            "Invalid include origin '{}': expected an absolute HTTP(S) URL",
+            input
+        )
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!(
+            "Invalid include origin '{}': only HTTP(S) origins are supported",
+            input
+        ));
+    }
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(format!(
+            "Invalid include origin '{}': URL has no origin",
+            input
+        ));
+    }
+    Ok(origin)
+}
+
 /// Parse the JS-evaluated origin storage data into an OriginStorage struct.
 fn parse_origin_storage(data: &Value) -> Option<OriginStorage> {
     if !data.is_object() {
@@ -252,6 +275,7 @@ pub async fn save_state(
     session_name: Option<&str>,
     session_id_str: &str,
     visited_origins: &HashSet<String>,
+    included_origins: &[String],
 ) -> Result<String, String> {
     let cookies = cookies::get_all_cookies(client, session_id).await?;
 
@@ -274,6 +298,9 @@ pub async fn save_state(
 
     // Merge visited origins with current frame tree origins
     let mut all_origins = visited_origins.clone();
+    for included_origin in included_origins {
+        all_origins.insert(normalize_included_origin(included_origin)?);
+    }
     if let Ok(tree_result) = client
         .send_command_no_params("Page.getFrameTree", Some(session_id))
         .await
@@ -382,6 +409,7 @@ pub async fn save_auto_state_transactional(
         Some(session_name),
         session_id_str,
         visited_origins,
+        &[],
     )
     .await?;
 
@@ -471,7 +499,7 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
         let cookie_values: Vec<Value> = state
             .cookies
             .iter()
-            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .map(Cookie::to_set_cookie_value)
             .collect();
         cookies::set_cookies(client, session_id, cookie_values, None).await?;
     }
@@ -860,6 +888,11 @@ mod tests {
                 secure: false,
                 session: true,
                 same_site: Some("Lax".to_string()),
+                priority: None,
+                source_scheme: None,
+                source_port: None,
+                partition_key: None,
+                partition_key_opaque: None,
             }],
             origins: vec![OriginStorage {
                 origin: "https://example.com".to_string(),
@@ -1007,6 +1040,14 @@ mod tests {
             secure: true,
             session: false,
             same_site: Some("Strict".to_string()),
+            priority: Some("High".to_string()),
+            source_scheme: Some("Secure".to_string()),
+            source_port: Some(443),
+            partition_key: Some(cookies::CookiePartitionKey {
+                top_level_site: "https://top.example".to_string(),
+                has_cross_site_ancestor: true,
+            }),
+            partition_key_opaque: Some(false),
         };
 
         let json = serde_json::to_value(&cookie).unwrap();
@@ -1014,6 +1055,36 @@ mod tests {
         assert_eq!(json["httpOnly"], false);
         assert_eq!(json["secure"], true);
         assert_eq!(json["sameSite"], "Strict");
+        assert_eq!(json["priority"], "High");
+        assert_eq!(json["sourceScheme"], "Secure");
+        assert_eq!(json["sourcePort"], 443);
+        assert_eq!(
+            json["partitionKey"],
+            json!({
+                "topLevelSite": "https://top.example",
+                "hasCrossSiteAncestor": true
+            })
+        );
+
+        let set_cookie = cookie.to_set_cookie_value();
+        assert_eq!(set_cookie["partitionKey"], json["partitionKey"]);
+        assert!(set_cookie.get("size").is_none());
+        assert!(set_cookie.get("session").is_none());
+        assert!(set_cookie.get("partitionKeyOpaque").is_none());
+    }
+
+    #[test]
+    fn test_normalize_included_origin_uses_only_scheme_host_and_port() {
+        assert_eq!(
+            normalize_included_origin("https://sso.example.com/login?next=%2F").unwrap(),
+            "https://sso.example.com"
+        );
+        assert_eq!(
+            normalize_included_origin("http://localhost:4173/path").unwrap(),
+            "http://localhost:4173"
+        );
+        assert!(normalize_included_origin("file:///tmp/auth.html").is_err());
+        assert!(normalize_included_origin("sso.example.com").is_err());
     }
 
     #[test]
