@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CloseTargetParams, CreateTargetParams,
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, CloseTargetParams, CreateTargetParams,
     CreateTargetResult, EvaluateParams,
 };
 use super::cookies::{self, Cookie};
@@ -189,72 +189,37 @@ async fn collect_storage_in_target(
     client
         .send_command_no_params("Runtime.enable", Some(temp_session))
         .await?;
-
-    // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
-    let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
-
-    let _ = client
+    client
+        .send_command_no_params("Network.enable", Some(temp_session))
+        .await?;
+    client
         .send_command(
-            "Fetch.enable",
-            Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
+            "Network.setRequestInterception",
+            Some(json!({
+                "patterns": [{
+                    "urlPattern": "*",
+                    "interceptionStage": "Request"
+                }]
+            })),
             Some(temp_session),
         )
-        .await;
+        .await?;
 
+    let blank_response_b64 = blank_html_response_b64();
     let mut event_rx = client.subscribe();
     let mut results = Vec::new();
 
     for target_origin in origins {
-        let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
-        if client
-            .send_command(
-                "Page.navigate",
-                Some(json!({ "url": nav_url })),
-                Some(temp_session),
-            )
-            .await
-            .is_err()
+        if navigate_to_intercepted_origin(
+            client,
+            temp_session,
+            &mut event_rx,
+            target_origin,
+            &blank_response_b64,
+        )
+        .await
+        .is_err()
         {
-            continue;
-        }
-
-        // Fulfill intercepted requests with blank HTML until the page loads
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        let mut page_loaded = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(tokio::time::Duration::from_secs(2), event_rx.recv()).await {
-                Ok(Ok(evt)) if evt.session_id.as_deref() == Some(temp_session) => {
-                    if evt.method == "Fetch.requestPaused" {
-                        if let Some(request_id) =
-                            evt.params.get("requestId").and_then(|v| v.as_str())
-                        {
-                            let _ = client
-                                .send_command(
-                                    "Fetch.fulfillRequest",
-                                    Some(json!({
-                                        "requestId": request_id,
-                                        "responseCode": 200,
-                                        "responseHeaders": [
-                                            { "name": "Content-Type", "value": "text/html" }
-                                        ],
-                                        "body": &blank_html_b64
-                                    })),
-                                    Some(temp_session),
-                                )
-                                .await;
-                        }
-                    } else if evt.method == "Page.loadEventFired" {
-                        page_loaded = true;
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => continue,  // event for a different session
-                Ok(Err(_)) => continue, // lagged or closed — retry within deadline
-                Err(_) => break,        // outer timeout elapsed
-            }
-        }
-
-        if !page_loaded {
             continue;
         }
 
@@ -266,6 +231,262 @@ async fn collect_storage_in_target(
     }
 
     Ok(results)
+}
+
+async fn navigate_to_intercepted_origin(
+    client: &CdpClient,
+    session_id: &str,
+    event_rx: &mut tokio::sync::broadcast::Receiver<CdpEvent>,
+    target_origin: &str,
+    blank_response_b64: &str,
+) -> Result<(), String> {
+    let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
+    client
+        .send_command_no_wait(
+            "Page.navigate",
+            Some(json!({ "url": nav_url })),
+            Some(session_id),
+        )
+        .await?;
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), event_rx.recv()).await {
+            Ok(Ok(evt)) if evt.session_id.as_deref() == Some(session_id) => {
+                if evt.method == "Network.requestIntercepted" {
+                    if let Some(interception_id) =
+                        evt.params.get("interceptionId").and_then(|v| v.as_str())
+                    {
+                        client
+                            .send_command(
+                                "Network.continueInterceptedRequest",
+                                Some(json!({
+                                    "interceptionId": interception_id,
+                                    "rawResponse": blank_response_b64
+                                })),
+                                Some(session_id),
+                            )
+                            .await?;
+                    }
+                } else if evt.method == "Page.loadEventFired" {
+                    return Ok(());
+                }
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    Err(format!(
+        "Timed out preparing storage origin {}",
+        target_origin
+    ))
+}
+
+fn blank_html_response_b64() -> String {
+    let body = "<html></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    base64::engine::general_purpose::STANDARD.encode(response)
+}
+
+async fn restore_local_storage_via_temp_target(
+    client: &CdpClient,
+    origins: &[OriginStorage],
+) -> Result<(), String> {
+    if !origins
+        .iter()
+        .any(|origin| !origin.local_storage.is_empty())
+    {
+        return Ok(());
+    }
+
+    let create_result: CreateTargetResult = client
+        .send_command_typed(
+            "Target.createTarget",
+            &CreateTargetParams {
+                url: "about:blank".to_string(),
+            },
+            None,
+        )
+        .await?;
+    let target_id = create_result.target_id;
+    let result = restore_storage_in_target(client, &target_id, origins).await;
+
+    let _ = client
+        .send_command_typed::<_, Value>(
+            "Target.closeTarget",
+            &CloseTargetParams { target_id },
+            None,
+        )
+        .await;
+
+    result
+}
+
+async fn restore_storage_in_target(
+    client: &CdpClient,
+    target_id: &str,
+    origins: &[OriginStorage],
+) -> Result<(), String> {
+    let attach_result: AttachToTargetResult = client
+        .send_command_typed(
+            "Target.attachToTarget",
+            &AttachToTargetParams {
+                target_id: target_id.to_string(),
+                flatten: true,
+            },
+            None,
+        )
+        .await?;
+    let temp_session = &attach_result.session_id;
+
+    client
+        .send_command_no_params("Page.enable", Some(temp_session))
+        .await?;
+    client
+        .send_command_no_params("Runtime.enable", Some(temp_session))
+        .await?;
+    client
+        .send_command_no_params("Network.enable", Some(temp_session))
+        .await?;
+    client
+        .send_command(
+            "Network.setRequestInterception",
+            Some(json!({
+                "patterns": [{
+                    "urlPattern": "*",
+                    "interceptionStage": "Request"
+                }]
+            })),
+            Some(temp_session),
+        )
+        .await?;
+
+    let blank_response_b64 = blank_html_response_b64();
+    let mut event_rx = client.subscribe();
+
+    for origin in origins {
+        if origin.local_storage.is_empty() {
+            continue;
+        }
+
+        navigate_to_intercepted_origin(
+            client,
+            temp_session,
+            &mut event_rx,
+            &origin.origin,
+            &blank_response_b64,
+        )
+        .await?;
+
+        for entry in &origin.local_storage {
+            set_storage_entry(client, temp_session, "localStorage", entry).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn restore_session_storage_in_active_target(
+    client: &CdpClient,
+    session_id: &str,
+    origins: &[OriginStorage],
+) -> Result<(), String> {
+    if !origins
+        .iter()
+        .any(|origin| !origin.session_storage.is_empty())
+    {
+        return Ok(());
+    }
+
+    client
+        .send_command_no_params("Page.enable", Some(session_id))
+        .await?;
+    client
+        .send_command_no_params("Runtime.enable", Some(session_id))
+        .await?;
+    client
+        .send_command_no_params("Network.enable", Some(session_id))
+        .await?;
+    client
+        .send_command(
+            "Network.setRequestInterception",
+            Some(json!({
+                "patterns": [{
+                    "urlPattern": "*",
+                    "interceptionStage": "Request"
+                }]
+            })),
+            Some(session_id),
+        )
+        .await?;
+
+    let blank_response_b64 = blank_html_response_b64();
+    let mut event_rx = client.subscribe();
+    let result: Result<(), String> = async {
+        for origin in origins {
+            if origin.session_storage.is_empty() {
+                continue;
+            }
+
+            navigate_to_intercepted_origin(
+                client,
+                session_id,
+                &mut event_rx,
+                &origin.origin,
+                &blank_response_b64,
+            )
+            .await?;
+
+            for entry in &origin.session_storage {
+                set_storage_entry(client, session_id, "sessionStorage", entry).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let disable_result = client
+        .send_command(
+            "Network.setRequestInterception",
+            Some(json!({ "patterns": [] })),
+            Some(session_id),
+        )
+        .await;
+    result?;
+    disable_result?;
+    Ok(())
+}
+
+async fn set_storage_entry(
+    client: &CdpClient,
+    session_id: &str,
+    storage_name: &str,
+    entry: &StorageEntry,
+) -> Result<(), String> {
+    let expression = format!(
+        "{}.setItem({}, {})",
+        storage_name,
+        serde_json::to_string(&entry.name).unwrap_or_default(),
+        serde_json::to_string(&entry.value).unwrap_or_default(),
+    );
+    client
+        .send_command_typed::<_, super::cdp::types::EvaluateResult>(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    Ok(())
 }
 
 pub async fn save_state(
@@ -504,63 +725,13 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
         cookies::set_cookies(client, session_id, cookie_values, None).await?;
     }
 
-    // Load storage per origin
-    for origin in &state.origins {
-        if origin.local_storage.is_empty() && origin.session_storage.is_empty() {
-            continue;
-        }
-
-        // Navigate to origin to set storage
-        let navigate_url = format!("{}/", origin.origin.trim_end_matches('/'));
-        client
-            .send_command(
-                "Page.navigate",
-                Some(json!({ "url": navigate_url })),
-                Some(session_id),
-            )
-            .await?;
-
-        // Brief wait for navigation
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        for entry in &origin.local_storage {
-            let js = format!(
-                "localStorage.setItem({}, {})",
-                serde_json::to_string(&entry.name).unwrap_or_default(),
-                serde_json::to_string(&entry.value).unwrap_or_default(),
-            );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
-        }
-
-        for entry in &origin.session_storage {
-            let js = format!(
-                "sessionStorage.setItem({}, {})",
-                serde_json::to_string(&entry.name).unwrap_or_default(),
-                serde_json::to_string(&entry.value).unwrap_or_default(),
-            );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
-        }
-    }
+    // Restore origin storage without contacting the saved origins. Real
+    // navigation can trigger sign-in flows before the final requested URL opens
+    // and invalidate freshly loaded cookies. localStorage is shared across tabs,
+    // so it can use a disposable target. sessionStorage belongs to the active tab,
+    // so it uses intercepted blank responses in that tab.
+    restore_local_storage_via_temp_target(client, &state.origins).await?;
+    restore_session_storage_in_active_target(client, session_id, &state.origins).await?;
 
     Ok(())
 }

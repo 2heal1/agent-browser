@@ -73,7 +73,7 @@ agent-browser --session "$SESSION" session info --json
 
 ### Manual State Files
 
-Use `state save`, `state load`, and `--state <path>` when you need an explicit portable JSON file. Repeat `state save --include-origin <url>` when a known SSO origin has localStorage that the active session did not visit. Do not make agents construct paths under `~/.agent-browser/sessions/`; prefer `--restore` for reusable agent sessions.
+Use `state save`, `state load`, and `--state <path>` when you need an explicit portable JSON file. State replay restores localStorage and sessionStorage through intercepted blank responses, so saved origins are not contacted before the requested navigation. Repeat `state save --include-origin <url>` when a known SSO origin has localStorage that the active session did not visit. Do not make agents construct paths under `~/.agent-browser/sessions/`; prefer `--restore` for reusable agent sessions.
 
 ## Common Patterns
 

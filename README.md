@@ -647,7 +647,7 @@ agent-browser --session "$SESSION" --restore --state ./my-auth.json open https:/
 # From now on, --session "$SESSION" --restore auto-saves/restores this state
 ```
 
-State files preserve HTTP-only and partitioned cookie metadata. Cookies are collected for the whole browser session. To also collect localStorage from an authentication origin that the active agent-browser session did not visit, repeat `--include-origin`:
+State files preserve HTTP-only and partitioned cookie metadata. Cookies are collected for the whole browser session. State replay restores localStorage and sessionStorage through intercepted blank responses, so saved origins are not contacted before the requested navigation. To also collect localStorage from an authentication origin that the active agent-browser session did not visit, repeat `--include-origin`:
 
 ```bash
 agent-browser --auto-connect state save ./my-auth.json \
