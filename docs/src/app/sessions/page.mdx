@@ -144,6 +144,8 @@ agent-browser --session "$SESSION" --restore --state ./my-auth.json open https:/
 
 State files contain session tokens in plaintext. Add them to `.gitignore` and delete when no longer needed. For encryption at rest, see [State encryption](#state-encryption) below.
 
+State replay restores localStorage and sessionStorage through intercepted blank responses, so saved origins are not contacted before the requested navigation.
+
 ## Session persistence
 
 Use `--restore` with a stable `--session` to automatically save and restore cookies and localStorage across browser restarts:

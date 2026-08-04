@@ -72,6 +72,7 @@ fork-only patches predictable.
 Changes listed here are carried by the Divebell release branch until they are available in an official agent-browser release.
 
 - **Portable SSO state (`0.33.2-divebell.2`):** Auth state preserves CDP cookie priority, source, port, and partition metadata. `state save --include-origin <url>` is repeatable across the CLI and MCP so known authentication origins can contribute localStorage even when the active browser session did not navigate through them.
+- **Side-effect-free state replay, pending release:** State loading restores localStorage and sessionStorage through intercepted blank responses so authentication origins are not contacted before the requested navigation and freshly loaded cookies cannot be invalidated by replay itself.
 
 ## Publishing the Divebell package
 

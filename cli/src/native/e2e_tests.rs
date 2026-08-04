@@ -10,6 +10,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3006,6 +3007,131 @@ async fn e2e_state_round_trips_partitioned_cookie_metadata() {
 
     let resp = execute_command(&json!({ "id": "7", "action": "close" }), &mut second).await;
     assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_state_load_restores_storage_without_contacting_saved_origins() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{}", port);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let request_count = server_requests.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let bytes_read = stream.read(&mut buf).await.unwrap_or(0);
+                if bytes_read > 0 {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = "<!doctype html><title>state target</title>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let output = tempfile::tempdir().unwrap();
+    let state_path = output.path().join("intercepted-storage-state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&json!({
+            "cookies": [{
+                "name": "portable_auth",
+                "value": "saved-cookie",
+                "domain": "127.0.0.1",
+                "path": "/",
+                "expires": 2000000000,
+                "size": 25,
+                "httpOnly": true,
+                "secure": false,
+                "session": false
+            }],
+            "origins": [{
+                "origin": origin,
+                "localStorage": [{
+                    "name": "portable-local",
+                    "value": "saved-local"
+                }],
+                "sessionStorage": [{
+                    "name": "portable-session",
+                    "value": "saved-session"
+                }]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut daemon = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    {
+        let manager = daemon.browser.as_ref().unwrap();
+        let session_id = manager.active_session_id().unwrap().to_string();
+        super::state::load_state(&manager.client, &session_id, state_path.to_str().unwrap())
+            .await
+            .unwrap();
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "state loading must not contact saved origins"
+    );
+
+    let resp = execute_command(&json!({ "id": "3", "action": "cookies_get" }), &mut daemon).await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["cookies"]
+        .as_array()
+        .is_some_and(|cookies| {
+            cookies.iter().any(|cookie| {
+                cookie["name"] == "portable_auth" && cookie["value"] == "saved-cookie"
+            })
+        }));
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "navigate", "url": origin }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "[localStorage.getItem('portable-local'), sessionStorage.getItem('portable-session')]"
+        }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"],
+        json!(["saved-local", "saved-session"])
+    );
+    assert!(requests.load(Ordering::SeqCst) > 0);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut daemon).await;
+    assert_success(&resp);
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------
