@@ -1504,8 +1504,15 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STATE_SAVE,
             "State save",
-            "Save cookies and storage state.",
-            json!({ "path": { "type": "string" } }),
+            "Save cookies and storage state, optionally collecting localStorage from additional HTTP(S) origins.",
+            json!({
+                "path": { "type": "string" },
+                "includeOrigins": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Additional origins to collect. Each value becomes a repeated --include-origin flag."
+                }
+            }),
             &["path"],
         ),
         tool(
@@ -2278,7 +2285,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_AUTH_LIST => call_literal(arguments, &["auth", "list"]),
         TOOL_AUTH_SHOW => call_one_string(arguments, "auth show", "name"),
         TOOL_AUTH_DELETE => call_one_string(arguments, "auth delete", "name"),
-        TOOL_STATE_SAVE => call_one_string(arguments, "state save", "path"),
+        TOOL_STATE_SAVE => call_state_save(arguments),
         TOOL_STATE_LOAD => call_one_string(arguments, "state load", "path"),
         TOOL_STATE_LIST => call_literal(arguments, &["state", "list"]),
         TOOL_STATE_CLEAR => call_state_clear(arguments),
@@ -3084,6 +3091,22 @@ fn call_auth_save(arguments: &Value) -> Result<Value, ProtocolError> {
     }
     args.push("--password-stdin".to_string());
     call_cli_tool(arguments, args, Some(password))
+}
+
+fn call_state_save(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, state_save_args(arguments)?, None)
+}
+
+fn state_save_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let path = required_string(arguments, "path")?;
+    let mut args = vec!["state".to_string(), "save".to_string(), path];
+    if let Some(origins) = optional_string_array(arguments, "includeOrigins")? {
+        for origin in origins {
+            args.push("--include-origin".to_string());
+            args.push(origin);
+        }
+    }
+    Ok(args)
 }
 
 fn call_state_clear(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4404,6 +4427,49 @@ mod tests {
             .unwrap();
         // Must stay in sync with the CLI parser's accepted --content values.
         assert_eq!(modes, &vec![json!("all"), json!("text"), json!("none")]);
+    }
+
+    #[test]
+    fn tool_schema_state_save_exposes_additional_origins() {
+        let tools = tools();
+        let state_save = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(TOOL_STATE_SAVE))
+            .unwrap();
+
+        assert_eq!(
+            state_save["inputSchema"]["properties"]["includeOrigins"]["type"],
+            "array"
+        );
+        assert_eq!(
+            state_save["inputSchema"]["properties"]["includeOrigins"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn state_save_args_repeat_include_origin_flags() {
+        let args = state_save_args(&json!({
+            "path": "auth.json",
+            "includeOrigins": [
+                "https://sso.example.com",
+                "https://accounts.example.net"
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "state",
+                "save",
+                "auth.json",
+                "--include-origin",
+                "https://sso.example.com",
+                "--include-origin",
+                "https://accounts.example.net"
+            ]
+        );
     }
 
     #[test]

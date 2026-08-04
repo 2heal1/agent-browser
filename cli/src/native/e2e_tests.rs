@@ -2834,6 +2834,180 @@ async fn e2e_save_state_cross_domain() {
     assert_success(&resp);
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_save_state_collects_explicit_included_origin() {
+    let (included_origin, server) = start_echo_server().await;
+    let output = tempfile::tempdir().unwrap();
+    let state_path = output.path().join("included-origin-state.json");
+    let mut daemon = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": &included_origin }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "storage_set",
+            "type": "local",
+            "key": "included_origin_key",
+            "value": "included_origin_value"
+        }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "navigate", "url": "about:blank" }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    {
+        let manager = daemon.browser.as_ref().unwrap();
+        let session_id = manager.active_session_id().unwrap().to_string();
+        super::state::save_state(
+            &manager.client,
+            &session_id,
+            Some(state_path.to_str().unwrap()),
+            None,
+            "included-origin-e2e",
+            &std::collections::HashSet::new(),
+            &[format!("{}/login", included_origin)],
+        )
+        .await
+        .unwrap();
+    }
+
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let included_storage = saved["origins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|origin| origin["origin"] == included_origin)
+        .expect("included origin should be present in saved state");
+    assert!(included_storage["localStorage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "included_origin_key"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut daemon).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_state_round_trips_partitioned_cookie_metadata() {
+    let output = tempfile::tempdir().unwrap();
+    let state_path = output.path().join("partitioned-cookie-state.json");
+    let mut first = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut first,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "cookies_set",
+            "cookies": [{
+                "name": "partitioned_auth",
+                "value": "partitioned_value",
+                "url": "https://auth.example.test/",
+                "secure": true,
+                "sameSite": "None",
+                "partitionKey": {
+                    "topLevelSite": "https://app.example.test",
+                    "hasCrossSiteAncestor": true
+                }
+            }]
+        }),
+        &mut first,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "state_save",
+            "path": state_path.to_str().unwrap()
+        }),
+        &mut first,
+    )
+    .await;
+    assert_success(&resp);
+
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let saved_partition_key = saved["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cookie| cookie["name"] == "partitioned_auth")
+        .and_then(|cookie| cookie.get("partitionKey"))
+        .cloned()
+        .expect("saved state should preserve the partition key");
+
+    let resp = execute_command(&json!({ "id": "4", "action": "close" }), &mut first).await;
+    assert_success(&resp);
+
+    let mut second = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "launch", "headless": true }),
+        &mut second,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "6",
+            "action": "state_load",
+            "path": state_path.to_str().unwrap()
+        }),
+        &mut second,
+    )
+    .await;
+    assert_success(&resp);
+
+    let manager = second.browser.as_ref().unwrap();
+    let session_id = manager.active_session_id().unwrap().to_string();
+    let cookies = manager
+        .client
+        .send_command_no_params("Network.getAllCookies", Some(&session_id))
+        .await
+        .unwrap();
+    let restored = cookies["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cookie| cookie["name"] == "partitioned_auth")
+        .expect("partitioned cookie should be restored");
+    assert_eq!(restored["partitionKey"], saved_partition_key);
+
+    let resp = execute_command(&json!({ "id": "7", "action": "close" }), &mut second).await;
+    assert_success(&resp);
+}
+
 // ---------------------------------------------------------------------------
 // Domain filter
 // ---------------------------------------------------------------------------

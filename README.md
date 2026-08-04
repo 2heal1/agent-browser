@@ -400,7 +400,7 @@ agent-browser errors                  # View page errors (uncaught JavaScript ex
 agent-browser errors --clear          # Clear errors
 agent-browser highlight <sel>         # Highlight element
 agent-browser inspect                 # Open Chrome DevTools for the active page
-agent-browser state save <path>       # Save auth state
+agent-browser state save <path> [--include-origin <url>]...  # Save auth state
 agent-browser state load <path>       # Load auth state
 agent-browser state list              # List saved state files
 agent-browser state show <file>       # Show state summary
@@ -645,6 +645,14 @@ agent-browser --state ./my-auth.json open https://app.example.com/dashboard
 SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
 agent-browser --session "$SESSION" --restore --state ./my-auth.json open https://app.example.com/dashboard
 # From now on, --session "$SESSION" --restore auto-saves/restores this state
+```
+
+State files preserve HTTP-only and partitioned cookie metadata. Cookies are collected for the whole browser session. To also collect localStorage from an authentication origin that the active agent-browser session did not visit, repeat `--include-origin`:
+
+```bash
+agent-browser --auto-connect state save ./my-auth.json \
+  --include-origin https://sso.example.com \
+  --include-origin https://accounts.example.net
 ```
 
 > **Security notes:**

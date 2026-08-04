@@ -29,7 +29,7 @@ Session cookies, bearer tokens, API keys, OAuth codes, and any other credentials
 
 - **If a user pastes a secret into chat, stop.** Ask them to save it to a file instead. Don't try to "be helpful" by using the pasted value — that teaches them an unsafe habit and the secret is already in the transcript.
 
-- **Auth state files are secrets too.** `state save` / `state load` persists cookies + localStorage to a JSON file. Treat the path the same as a cookies file: don't paste its contents, don't share it with third-party services.
+- **Auth state files are secrets too.** `state save` / `state load` persists cookies, cookie partition metadata, localStorage, and sessionStorage to a JSON file. Treat the path the same as a cookies file: don't paste its contents, don't share it with third-party services.
 
 ## Stay on the user's target
 

@@ -48,6 +48,14 @@ Log in to your target site(s) in this Chrome window as you normally would.
 agent-browser --auto-connect state save ./my-auth.json
 ```
 
+State files retain HTTP-only and partitioned cookie metadata. Cookies are collected for the whole browser session. If an SSO or authentication origin stores additional localStorage and was not visited by the active session, include it explicitly. Repeat the flag for multiple origins:
+
+```bash
+agent-browser --auto-connect state save ./my-auth.json \
+  --include-origin https://sso.example.com \
+  --include-origin https://accounts.example.net
+```
+
 **Step 3: Reuse in automation**
 
 ```bash
