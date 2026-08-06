@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - codex/openruntime-agent-browser-release
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - codex/openruntime-agent-browser-release
   workflow_dispatch:
 
 jobs:
@@ -317,3 +321,37 @@ jobs:
           }
           echo "Shim correctly points to native binary"
         shell: pwsh
+
+  node20-runtime:
+    name: Node 20 Runtime Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js for package assembly
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - name: Build native CLI
+        run: cargo build --release --manifest-path cli/Cargo.toml
+
+      - name: Assemble npm package
+        run: |
+          cp cli/target/release/agent-browser bin/agent-browser-linux-x64
+          chmod +x bin/agent-browser-linux-x64
+          npm pack
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.2
+
+      - name: Install packed package and run native wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/node20-prefix"
+          npm install --global --prefix "$prefix" agent-browser-*.tgz
+          "$prefix/bin/agent-browser" --version
