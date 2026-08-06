@@ -77,6 +77,7 @@ Detects your installation method (npm, Homebrew, or Cargo) and runs the appropri
 ### Requirements
 
 - **Chrome** - Run `agent-browser install` to download Chrome from [Chrome for Testing](https://developer.chrome.com/blog/chrome-for-testing/) (Google's official automation channel). Existing Chrome, Brave, Playwright, and Puppeteer installations are detected automatically. No Playwright or Node.js required for the daemon.
+- **Node.js 20.19+** - Required when installing or invoking the npm package wrapper. The native daemon itself does not require Node.js.
 - **Node.js 24+ and pnpm 11+** - Only needed when building from source.
 - **Rust** - Only needed when building from source (see From Source above).
 
