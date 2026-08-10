@@ -30,6 +30,27 @@
       "default": "auto",
       "description": "Auto-save policy for restored state."
     },
+    "restoreInitialSave": {
+      "type": "boolean",
+      "default": true,
+      "description": "Save once after a newly launched page has been quiet for about two seconds."
+    },
+    "restorePeriodicSave": {
+      "type": "boolean",
+      "default": true,
+      "description": "Continue saving restored state periodically while the browser remains open."
+    },
+    "restoreCloseSave": {
+      "type": "boolean",
+      "default": true,
+      "description": "Save restored state before close, daemon shutdown, or a compatible relaunch."
+    },
+    "restorePeriodicSaveIntervalMs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 30000,
+      "description": "Minimum milliseconds between periodic saves. Zero disables only the periodic stage."
+    },
     "restoreCheckUrl": {
       "type": "string",
       "description": "URL glob that restored state must match before auto-save."

@@ -345,6 +345,15 @@ pub struct DaemonState {
     pub event_tracker: EventTracker,
     pub session_name: Option<String>,
     pub restore_save: String,
+    /// Whether to save once after a newly launched browser has been quiet for
+    /// [`AUTOSAVE_QUIET_PERIOD_MS`].
+    pub restore_initial_save: bool,
+    /// Whether to keep saving after the initial save while the browser stays open.
+    pub restore_periodic_save: bool,
+    /// Whether lifecycle close, shutdown, and relaunch paths save the latest state.
+    pub restore_close_save: bool,
+    /// Minimum delay between periodic save attempts.
+    pub restore_periodic_save_interval_ms: u64,
     pub restore_check_url: Option<String>,
     pub restore_check_text: Option<String>,
     pub restore_check_fn: Option<String>,
@@ -362,6 +371,10 @@ pub struct DaemonState {
     /// When session state was last saved or a periodic autosave last failed,
     /// used to enforce the minimum interval between periodic saves.
     pub last_autosave_attempt: Option<std::time::Instant>,
+    /// True until the one-time post-launch save has been attempted.
+    pub initial_restore_save_pending: bool,
+    /// Prevents a later command from re-arming the initial save for the same browser.
+    pub initial_restore_save_attempted: bool,
     pub session_id: String,
     pub tracing_state: TracingState,
     /// Shared lifecycle state for allocation sampling and heap snapshots.
@@ -464,6 +477,18 @@ fn default_idle_shutdown_is_blocked(
     is_webdriver || (!provider_owned && browser_blocks_shutdown)
 }
 
+fn restore_save_stage_from_env(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | ""
+            )
+        })
+        .unwrap_or(default)
+}
+
 impl DaemonState {
     pub fn new() -> Self {
         Self {
@@ -484,6 +509,22 @@ impl DaemonState {
             restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
                 .ok()
                 .unwrap_or_else(|| "auto".to_string()),
+            restore_initial_save: restore_save_stage_from_env(
+                "AGENT_BROWSER_RESTORE_INITIAL_SAVE",
+                true,
+            ),
+            restore_periodic_save: restore_save_stage_from_env(
+                "AGENT_BROWSER_RESTORE_PERIODIC_SAVE",
+                true,
+            ),
+            restore_close_save: restore_save_stage_from_env(
+                "AGENT_BROWSER_RESTORE_CLOSE_SAVE",
+                true,
+            ),
+            restore_periodic_save_interval_ms: env::var("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30_000),
             restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL").ok(),
             restore_check_text: env::var("AGENT_BROWSER_RESTORE_CHECK_TEXT").ok(),
             restore_check_fn: env::var("AGENT_BROWSER_RESTORE_CHECK_FN").ok(),
@@ -496,6 +537,8 @@ impl DaemonState {
             restore_saved_path: None,
             last_command_finished: None,
             last_autosave_attempt: None,
+            initial_restore_save_pending: false,
+            initial_restore_save_attempted: false,
             session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
             tracing_state: TracingState::new(),
             memory_state: MemoryState::new(),
@@ -1822,6 +1865,9 @@ fn reset_restore_runtime_state(state: &mut DaemonState) {
     state.restore_validation_pending = false;
     state.restore_save_status = "not_attempted".to_string();
     state.restore_saved_path = None;
+    state.initial_restore_save_pending = false;
+    state.initial_restore_save_attempted = false;
+    state.last_autosave_attempt = None;
 }
 
 fn command_restore_check_fields(
@@ -1901,6 +1947,26 @@ fn apply_restore_config_from_command(cmd: &Value, state: &mut DaemonState) -> Re
     if let Some(policy) = cmd.get("restoreSave").map(|v| v.as_str().unwrap_or("auto")) {
         state.restore_save = policy.to_string();
     }
+    if let Some(enabled) = cmd.get("restoreInitialSave").and_then(Value::as_bool) {
+        state.restore_initial_save = enabled;
+        if !enabled {
+            state.initial_restore_save_pending = false;
+        } else if has_active_browser_session(state) && !state.initial_restore_save_attempted {
+            state.initial_restore_save_pending = true;
+        }
+    }
+    if let Some(enabled) = cmd.get("restorePeriodicSave").and_then(Value::as_bool) {
+        state.restore_periodic_save = enabled;
+    }
+    if let Some(enabled) = cmd.get("restoreCloseSave").and_then(Value::as_bool) {
+        state.restore_close_save = enabled;
+    }
+    if let Some(interval_ms) = cmd
+        .get("restorePeriodicSaveIntervalMs")
+        .and_then(Value::as_u64)
+    {
+        state.restore_periodic_save_interval_ms = interval_ms;
+    }
     if let Some(new_checks) = command_restore_check_fields(cmd) {
         state.restore_check_url = new_checks.0.clone();
         state.restore_check_text = new_checks.1.clone();
@@ -1929,6 +1995,22 @@ fn validate_restore_config_from_command(cmd: &Value) -> Result<(), String> {
                 policy
             ));
         }
+    }
+
+    for field in [
+        "restoreInitialSave",
+        "restorePeriodicSave",
+        "restoreCloseSave",
+    ] {
+        if cmd.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("{} must be true or false.", field));
+        }
+    }
+    if cmd
+        .get("restorePeriodicSaveIntervalMs")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err("restorePeriodicSaveIntervalMs must be a non-negative integer.".to_string());
     }
 
     Ok(())
@@ -2213,6 +2295,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         let has_internal_fields = cmd.get("plugins").is_some()
             || cmd.get("restoreKey").is_some()
             || cmd.get("restoreSave").is_some()
+            || cmd.get("restoreInitialSave").is_some()
+            || cmd.get("restorePeriodicSave").is_some()
+            || cmd.get("restoreCloseSave").is_some()
+            || cmd.get("restorePeriodicSaveIntervalMs").is_some()
             || cmd.get("restoreCheckUrl").is_some()
             || cmd.get("restoreCheckText").is_some()
             || cmd.get("restoreCheckFn").is_some();
@@ -2222,6 +2308,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 obj.remove("plugins");
                 obj.remove("restoreKey");
                 obj.remove("restoreSave");
+                obj.remove("restoreInitialSave");
+                obj.remove("restorePeriodicSave");
+                obj.remove("restoreCloseSave");
+                obj.remove("restorePeriodicSaveIntervalMs");
                 obj.remove("restoreCheckUrl");
                 obj.remove("restoreCheckText");
                 obj.remove("restoreCheckFn");
@@ -2350,6 +2440,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
                 return error_response(&id, &format!("Auto-launch failed: {}", e));
             }
+            mark_browser_launched_for_restore_save(state);
             lifecycle_launched = true;
         } else {
             lifecycle_reused = true;
@@ -2603,6 +2694,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mouseup" => handle_mouseup(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
+
+    if action == "launch"
+        && result
+            .as_ref()
+            .is_ok_and(|data| data.get("reused").and_then(Value::as_bool) != Some(true))
+    {
+        mark_browser_launched_for_restore_save(state);
+    }
 
     if result.is_ok() && should_validate_restore_after_action(action) {
         validate_restore_if_pending(state).await;
@@ -3709,17 +3808,26 @@ fn mark_explicit_storage_state_loaded(state: &mut DaemonState, path: &str) {
 }
 
 /// Quiet time required after the last command before a periodic autosave may
-/// run, so a multi-second save never stalls an active command burst.
+/// run. The same quiet period provides the post-launch stabilization delay for
+/// the one-time initial save.
 const AUTOSAVE_QUIET_PERIOD_MS: u64 = 2_000;
 
-/// Whether the daemon's periodic tick should attempt an autosave right now.
-///
-/// Timing and dialog pre-checks only; restore-key, save-policy, and browser
-/// gating live in `maybe_autosave_restore_state` and `auto_save_restore_state`.
-fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
-    if interval_ms == 0 {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreSavePhase {
+    Initial,
+    Periodic,
+    Close,
+}
+
+fn restore_save_phase_enabled(state: &DaemonState, phase: RestoreSavePhase) -> bool {
+    match phase {
+        RestoreSavePhase::Initial => state.restore_initial_save,
+        RestoreSavePhase::Periodic => state.restore_periodic_save,
+        RestoreSavePhase::Close => state.restore_close_save,
     }
+}
+
+fn restore_save_quiet_period_elapsed(state: &DaemonState) -> bool {
     // A JS dialog blocks the renderer's main thread, so the storage-collection
     // evaluate would hang until its CDP timeout. Wait for the dialog instead.
     if state.pending_dialog.is_some() {
@@ -3731,43 +3839,88 @@ fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
             return false;
         }
     }
+    true
+}
+
+fn initial_restore_save_due(state: &DaemonState) -> bool {
+    state.initial_restore_save_pending
+        && state.restore_initial_save
+        && restore_save_quiet_period_elapsed(state)
+}
+
+/// Whether the daemon's background tick should attempt a periodic save now.
+fn periodic_restore_save_due(state: &DaemonState) -> bool {
+    if !state.restore_periodic_save || state.restore_periodic_save_interval_ms == 0 {
+        return false;
+    }
+    if !restore_save_quiet_period_elapsed(state) {
+        return false;
+    }
     if let Some(t) = state.last_autosave_attempt {
-        if now.duration_since(t) < std::time::Duration::from_millis(interval_ms) {
+        if std::time::Instant::now().duration_since(t)
+            < std::time::Duration::from_millis(state.restore_periodic_save_interval_ms)
+        {
             return false;
         }
     }
     true
 }
 
-/// Periodically persist session state while a browser is open with a restore
-/// key configured, so a browser the user closes by hand (which kills CDP and
-/// makes save-on-close impossible) loses at most roughly `interval_ms` of
-/// state. Saves stay eligible even without new commands: the page itself can
-/// mutate cookies and storage while idle (token refreshes, background
-/// requests), so idle sessions are re-saved on every interval too.
+fn mark_browser_launched_for_restore_save(state: &mut DaemonState) {
+    state.initial_restore_save_attempted = false;
+    state.initial_restore_save_pending =
+        state.session_name.is_some() && state.restore_save != "never" && state.restore_initial_save;
+    // Anchor a periodic-only policy at browser launch rather than letting it
+    // save immediately after the two-second quiet period.
+    state.last_autosave_attempt = Some(std::time::Instant::now());
+}
+
+/// Persist the one-time post-launch save or an enabled periodic save.
 ///
 /// Called from the daemon's background tick. Failures are expected while a
-/// page is mid-navigation; the next interval retries, and
-/// `auto_save_restore_state` records the status either way.
-pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interval_ms: u64) {
-    if !autosave_due(state, interval_ms) {
-        return;
-    }
-    // Sessions without a restore key, or with saving disabled, never autosave.
+/// page is mid-navigation. An initial save is attempted exactly once per
+/// browser launch; periodic failures retry after the configured interval.
+pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState) {
+    // Sessions without a restore key, with saving disabled, or without a CDP
+    // browser have nothing that a background save can persist.
     if state.session_name.is_none() || state.restore_save == "never" {
         return;
     }
-    // No browser means nothing to collect from.
     if state.browser.is_none() {
         return;
     }
+
+    if initial_restore_save_due(state) {
+        state.initial_restore_save_pending = false;
+        state.initial_restore_save_attempted = true;
+        state.last_autosave_attempt = Some(std::time::Instant::now());
+        let _ = save_restore_state_for_phase(state, RestoreSavePhase::Initial).await;
+        return;
+    }
+
+    if !periodic_restore_save_due(state) {
+        return;
+    }
     state.last_autosave_attempt = Some(std::time::Instant::now());
-    let _ = auto_save_restore_state(state).await;
+    let _ = save_restore_state_for_phase(state, RestoreSavePhase::Periodic).await;
 }
 
 pub(crate) async fn auto_save_restore_state(
     state: &mut DaemonState,
 ) -> Result<Option<String>, String> {
+    save_restore_state_for_phase(state, RestoreSavePhase::Close).await
+}
+
+async fn save_restore_state_for_phase(
+    state: &mut DaemonState,
+    phase: RestoreSavePhase,
+) -> Result<Option<String>, String> {
+    if !restore_save_phase_enabled(state, phase) {
+        state.restore_save_status = "disabled".to_string();
+        state.restore_saved_path = None;
+        return Ok(None);
+    }
+
     validate_restore_if_pending(state).await;
 
     let Some(session_name) = state.session_name.clone() else {
@@ -5783,6 +5936,10 @@ async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
         "restoreLoadedPath": state.restore_loaded_path,
         "restoreValidationPending": state.restore_validation_pending,
         "restoreSave": state.restore_save,
+        "restoreInitialSave": state.restore_initial_save,
+        "restorePeriodicSave": state.restore_periodic_save,
+        "restoreCloseSave": state.restore_close_save,
+        "restorePeriodicSaveIntervalMs": state.restore_periodic_save_interval_ms,
         "saveStatus": state.restore_save_status,
         "restoreSavedPath": state.restore_saved_path,
         "restoreCheckUrl": state.restore_check_url,
@@ -11956,27 +12113,37 @@ mod tests {
     }
 
     #[test]
-    fn test_autosave_due_requires_interval() {
-        let state = DaemonState::new();
+    fn test_periodic_restore_save_requires_enabled_nonzero_interval() {
+        let mut state = DaemonState::new();
         assert!(
-            autosave_due(&state, 30_000),
+            periodic_restore_save_due(&state),
             "idle sessions stay eligible so page-driven mutations get saved"
         );
-        assert!(!autosave_due(&state, 0), "interval 0 disables autosave");
+        state.restore_periodic_save_interval_ms = 0;
+        assert!(
+            !periodic_restore_save_due(&state),
+            "interval 0 disables only periodic saves"
+        );
+        state.restore_periodic_save_interval_ms = 30_000;
+        state.restore_periodic_save = false;
+        assert!(!periodic_restore_save_due(&state));
     }
 
     #[test]
-    fn test_autosave_waits_for_quiet_period_after_command() {
+    fn test_initial_and_periodic_save_wait_for_quiet_period_after_command() {
         let mut state = DaemonState::new();
+        state.initial_restore_save_pending = true;
 
         state.last_command_finished = Some(std::time::Instant::now());
-        assert!(!autosave_due(&state, 30_000));
+        assert!(!initial_restore_save_due(&state));
+        assert!(!periodic_restore_save_due(&state));
 
         state.last_command_finished = std::time::Instant::now().checked_sub(
             std::time::Duration::from_millis(AUTOSAVE_QUIET_PERIOD_MS + 1_000),
         );
         assert!(state.last_command_finished.is_some());
-        assert!(autosave_due(&state, 30_000));
+        assert!(initial_restore_save_due(&state));
+        assert!(periodic_restore_save_due(&state));
     }
 
     #[test]
@@ -11984,12 +12151,12 @@ mod tests {
         let mut state = DaemonState::new();
 
         state.last_autosave_attempt = Some(std::time::Instant::now());
-        assert!(!autosave_due(&state, 30_000));
+        assert!(!periodic_restore_save_due(&state));
 
         state.last_autosave_attempt =
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(31));
         assert!(state.last_autosave_attempt.is_some());
-        assert!(autosave_due(&state, 30_000));
+        assert!(periodic_restore_save_due(&state));
     }
 
     #[test]
@@ -12002,7 +12169,9 @@ mod tests {
             default_prompt: None,
             session_id: None,
         });
-        assert!(!autosave_due(&state, 30_000));
+        state.initial_restore_save_pending = true;
+        assert!(!initial_restore_save_due(&state));
+        assert!(!periodic_restore_save_due(&state));
     }
 
     #[tokio::test]
@@ -12010,7 +12179,7 @@ mod tests {
         // No restore key: the tick is a no-op.
         let mut state = DaemonState::new();
         state.session_name = None;
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
 
@@ -12018,7 +12187,7 @@ mod tests {
         let mut state = DaemonState::new();
         state.session_name = Some("my-session".to_string());
         state.restore_save = "never".to_string();
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
     }
@@ -12028,9 +12197,27 @@ mod tests {
         let mut state = DaemonState::new();
         state.session_name = Some("my-session".to_string());
         state.restore_save = "auto".to_string();
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert!(state.last_autosave_attempt.is_none());
         assert_eq!(state.restore_save_status, "not_attempted");
+    }
+
+    #[test]
+    fn test_restore_save_stages_are_independent() {
+        let mut state = DaemonState::new();
+        state.restore_initial_save = false;
+        state.restore_periodic_save = true;
+        state.restore_close_save = false;
+
+        assert!(!restore_save_phase_enabled(
+            &state,
+            RestoreSavePhase::Initial
+        ));
+        assert!(restore_save_phase_enabled(
+            &state,
+            RestoreSavePhase::Periodic
+        ));
+        assert!(!restore_save_phase_enabled(&state, RestoreSavePhase::Close));
     }
 
     #[test]
@@ -12088,6 +12275,10 @@ mod tests {
             &json!({
                 "restoreKey": "same-key",
                 "restoreSave": "auto",
+                "restoreInitialSave": false,
+                "restorePeriodicSave": true,
+                "restoreCloseSave": true,
+                "restorePeriodicSaveIntervalMs": 65000,
                 "restoreCheckUrl": null,
                 "restoreCheckText": null,
                 "restoreCheckFn": null
@@ -12097,6 +12288,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.restore_save, "auto");
+        assert!(!state.restore_initial_save);
+        assert!(state.restore_periodic_save);
+        assert!(state.restore_close_save);
+        assert_eq!(state.restore_periodic_save_interval_ms, 65_000);
         assert!(state.restore_check_url.is_none());
         assert!(state.restore_check_text.is_none());
         assert!(state.restore_check_fn.is_none());
@@ -12157,6 +12352,36 @@ mod tests {
         assert!(err.contains("Invalid restore save policy"));
         assert!(state.session_name.is_none());
         assert_eq!(state.restore_save, "auto");
+    }
+
+    #[test]
+    fn test_restore_config_rejects_invalid_stage_values() {
+        let mut state = DaemonState::new();
+
+        let err = apply_restore_config_from_command(
+            &json!({
+                "restoreKey": "same-key",
+                "restoreInitialSave": "no"
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("restoreInitialSave must be true or false"));
+        assert!(state.session_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_restore_save_never_disables_close_even_when_close_stage_is_enabled() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("same-key".to_string());
+        state.restore_save = "never".to_string();
+        state.restore_close_save = true;
+
+        let saved = auto_save_restore_state(&mut state).await.unwrap();
+
+        assert!(saved.is_none());
+        assert_eq!(state.restore_save_status, "disabled");
     }
 
     #[test]

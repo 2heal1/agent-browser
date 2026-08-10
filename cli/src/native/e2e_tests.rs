@@ -6901,11 +6901,19 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
     let env = EnvGuard::new(&[
         "AGENT_BROWSER_SESSION_NAME",
         "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_RESTORE_INITIAL_SAVE",
+        "AGENT_BROWSER_RESTORE_PERIODIC_SAVE",
+        "AGENT_BROWSER_RESTORE_CLOSE_SAVE",
+        "AGENT_BROWSER_AUTOSAVE_INTERVAL_MS",
         "AGENT_BROWSER_STATE",
         "AGENT_BROWSER_ENCRYPTION_KEY",
     ]);
     env.remove("AGENT_BROWSER_SESSION_NAME");
     env.remove("AGENT_BROWSER_RESTORE_SAVE");
+    env.remove("AGENT_BROWSER_RESTORE_INITIAL_SAVE");
+    env.remove("AGENT_BROWSER_RESTORE_PERIODIC_SAVE");
+    env.remove("AGENT_BROWSER_RESTORE_CLOSE_SAVE");
+    env.remove("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS");
     env.remove("AGENT_BROWSER_STATE");
     env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
 
@@ -7057,17 +7065,18 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         assert_success(&resp);
 
         // The command just finished, so the quiet period must block the tick.
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert_eq!(state.restore_save_status, "not_attempted");
         assert!(
             super::state::find_auto_state_file(&restore_key).is_none(),
             "autosave must not fire inside the post-command quiet period"
         );
 
-        // Simulate the quiet period having elapsed, then run the tick again.
+        // Simulate the quiet period having elapsed. The first eligible tick is
+        // the one-time initial save.
         state.last_command_finished =
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert_eq!(state.restore_save_status, "saved");
         assert!(
             state.last_autosave_attempt.is_some(),
@@ -7075,7 +7084,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         );
         assert!(
             super::state::find_auto_state_file(&restore_key).is_some(),
-            "periodic autosave should write the session state file"
+            "initial autosave should write the session state file"
         );
 
         // An idle session stays eligible: once the interval elapses again the
@@ -7083,7 +7092,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         state.last_autosave_attempt =
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(31));
         state.restore_save_status = "not_attempted".to_string();
-        maybe_autosave_restore_state(&mut state, 30_000).await;
+        maybe_autosave_restore_state(&mut state).await;
         assert_eq!(
             state.restore_save_status, "saved",
             "idle session should be re-saved on the next interval without new commands"

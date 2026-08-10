@@ -565,6 +565,10 @@ See [Init Scripts & Extensions](/init-scripts) for launch-time scripts, runtime 
 --session <name>         # Isolated browser session
 --restore [name]         # Auto-save/restore session state, defaults to --session
 --restore-save <policy>  # Restore save policy: auto, always, never
+--restore-initial-save <bool> # One post-launch save after about two seconds
+--restore-periodic-save <bool> # Continue saving periodically while open
+--restore-close-save <bool> # Save before close, shutdown, or relaunch
+--restore-periodic-save-interval-ms <ms> # Minimum periodic interval; 0 disables periodic only
 --namespace <name>       # Isolate daemon sockets and restore-state directories
 --profile <path>         # Persistent browser profile directory
 --state <path>           # Load storage state from JSON file

@@ -64,6 +64,10 @@ Global launch, output, provider, and chat options can be set in the config file 
     <tr><td><code>session</code></td><td><code>--session</code></td><td>string</td></tr>
     <tr><td><code>restore</code></td><td><code>--restore</code></td><td>string</td></tr>
     <tr><td><code>restoreSave</code></td><td><code>--restore-save</code></td><td>string</td></tr>
+    <tr><td><code>restoreInitialSave</code></td><td><code>--restore-initial-save</code></td><td>boolean</td></tr>
+    <tr><td><code>restorePeriodicSave</code></td><td><code>--restore-periodic-save</code></td><td>boolean</td></tr>
+    <tr><td><code>restoreCloseSave</code></td><td><code>--restore-close-save</code></td><td>boolean</td></tr>
+    <tr><td><code>restorePeriodicSaveIntervalMs</code></td><td><code>--restore-periodic-save-interval-ms</code></td><td>integer</td></tr>
     <tr><td><code>restoreCheckUrl</code></td><td><code>--restore-check-url</code></td><td>string</td></tr>
     <tr><td><code>restoreCheckText</code></td><td><code>--restore-check-text</code></td><td>string</td></tr>
     <tr><td><code>restoreCheckFn</code></td><td><code>--restore-check-fn</code></td><td>string</td></tr>
@@ -261,7 +265,10 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_NAMESPACE</code></td><td>Namespace for daemon sockets and restore-state directories.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE</code></td><td>Auto-save/load state persistence key.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_SAVE</code></td><td>Restore save policy: <code>auto</code>, <code>always</code>, or <code>never</code>.</td><td><code>auto</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_AUTOSAVE_INTERVAL_MS</code></td><td>Minimum ms between periodic session autosaves while the browser is open. <code>0</code> saves only on close.</td><td><code>30000</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_RESTORE_INITIAL_SAVE</code></td><td>Enable the one-time post-launch save after about two seconds.</td><td><code>true</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_RESTORE_PERIODIC_SAVE</code></td><td>Enable periodic saves while the browser remains open.</td><td><code>true</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_RESTORE_CLOSE_SAVE</code></td><td>Enable saves before close, daemon shutdown, and relaunch.</td><td><code>true</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_AUTOSAVE_INTERVAL_MS</code></td><td>Minimum ms between periodic saves. <code>0</code> disables only the periodic stage.</td><td><code>30000</code></td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_URL</code></td><td>URL pattern restored state must match.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_TEXT</code></td><td>Page text restored state must contain.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_FN</code></td><td>JavaScript expression restored state must satisfy.</td><td>(none)</td></tr>

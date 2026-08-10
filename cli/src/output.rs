@@ -3889,13 +3889,21 @@ Authentication:
   --profile <name|path>      Chrome profile name (e.g., Default) to reuse login state,
                              or a directory path for a persistent custom profile
                              (or AGENT_BROWSER_PROFILE env)
-  --restore [name]           Auto-save/restore cookies and localStorage.
+  --restore [name]           Auto-save/restore cookies, localStorage, and sessionStorage.
                              Without a name, uses --session as the restore key
                              (or AGENT_BROWSER_RESTORE env)
   --restore-save <policy>    Restore auto-save policy: auto, always, never (default: auto)
+  --restore-initial-save <bool> Save once after the page is quiet for about 2s (default: true)
+  --restore-periodic-save <bool> Continue saving while the browser stays open (default: true)
+  --restore-close-save <bool> Save before close, shutdown, or relaunch (default: true)
+  --restore-periodic-save-interval-ms <ms> Minimum periodic save interval (default: 30000)
+                             An interval of 0 disables periodic saves only
+                             --restore-save never disables every save stage
   --restore-check-url <glob> Validate restored state against current URL pattern
   --restore-check-text <txt> Validate restored state against visible page text
   --restore-check-fn <js>    Validate restored state against a truthy JS expression
+                             Cross-origin saves use a temporary background target when supported;
+                             a foreground fallback may briefly appear, but does not refresh the page
   --session-name <name>      Legacy alias for restore persistence key
                              (or AGENT_BROWSER_SESSION_NAME env)
   --state <path>             Load saved auth state (cookies + storage) from JSON file
@@ -3972,7 +3980,7 @@ Configuration:
   Extensions from user and project configs are merged (not replaced).
 
   Example agent-browser.json:
-    {{"headed": true, "hideScrollbars": false, "proxy": "http://localhost:8080"}}
+    {{"headed": true, "restorePeriodicSave": false, "proxy": "http://localhost:8080"}}
 
   Plugin example:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
@@ -3983,7 +3991,10 @@ Environment:
   AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state
   AGENT_BROWSER_RESTORE          Auto-save/restore persistence key
   AGENT_BROWSER_RESTORE_SAVE     Restore save policy: auto, always, never
-  AGENT_BROWSER_AUTOSAVE_INTERVAL_MS Min ms between periodic session autosaves (default: 30000, 0 disables)
+  AGENT_BROWSER_RESTORE_INITIAL_SAVE One post-launch save after about 2s (default: true)
+  AGENT_BROWSER_RESTORE_PERIODIC_SAVE Periodic saves while open (default: true)
+  AGENT_BROWSER_RESTORE_CLOSE_SAVE Save before close, shutdown, or relaunch (default: true)
+  AGENT_BROWSER_AUTOSAVE_INTERVAL_MS Min ms between periodic saves (default: 30000; 0 disables periodic only)
   AGENT_BROWSER_RESTORE_CHECK_URL URL pattern restored state must match
   AGENT_BROWSER_RESTORE_CHECK_TEXT Page text restored state must contain
   AGENT_BROWSER_RESTORE_CHECK_FN JS expression restored state must satisfy

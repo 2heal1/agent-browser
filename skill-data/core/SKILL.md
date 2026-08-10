@@ -235,7 +235,9 @@ SESSION="$(agent-browser session id --scope worktree --prefix my-app)"
 agent-browser --session "$SESSION" --restore open https://app.example.com
 ```
 
-`--restore` with no value uses the current `--session` as the persistence key. Agent skills should prefer this over hand-built state file paths. Use `--restore-save auto` by default so a failed restore does not overwrite the previous known-good state. State is saved on close and also periodically while the browser is open (at most once per `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS`, default 30000), so state survives even if the user closes the browser window by hand.
+`--restore` with no value uses the current `--session` as the persistence key. Agent skills should prefer this over hand-built state file paths. Restore State contains cookies, localStorage, and sessionStorage; it is not a complete Chrome Profile. Use `--restore-save auto` by default so a failed restore does not overwrite the previous known-good state.
+
+The initial, periodic, and close save stages are independent. agent-browser enables all three by default: it saves once after the launched page is quiet for about two seconds, continues at `--restore-periodic-save-interval-ms` intervals, and saves before close, shutdown, idle timeout, or compatible relaunch. Use `--restore-initial-save false` to avoid the initial cross-origin storage target, `--restore-periodic-save false` to stop background saves, or `--restore-close-save false` to suppress lifecycle saves. `--restore-save never` is stronger and disables every stage. The stage settings are attached to every command, so they also update an already-running daemon.
 
 ```bash
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open https://app.example.com
@@ -450,6 +452,10 @@ EOF
 --state <path>          # load saved auth state from JSON
 --restore [name]        # auto-save/restore session state, defaults to --session
 --restore-save <policy> # auto, always, or never
+--restore-initial-save <bool> # one save after about two quiet seconds
+--restore-periodic-save <bool> # continue saving periodically
+--restore-close-save <bool> # save before close, shutdown, or relaunch
+--restore-periodic-save-interval-ms <ms> # periodic interval; 0 disables periodic only
 --namespace <name>      # isolate daemon sockets and restore-state directories
 ```
 
