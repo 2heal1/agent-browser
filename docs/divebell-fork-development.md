@@ -75,6 +75,7 @@ Changes listed here are carried by the Divebell release branch until they are av
 - **Side-effect-free state replay (`0.33.2-divebell.3`):** State loading restores localStorage and sessionStorage through intercepted blank responses so authentication origins are not contacted before the requested navigation and freshly loaded cookies cannot be invalidated by replay itself.
 - **Install-script-free package (`0.33.2-divebell.3`):** The Divebell package relies on its bundled native binaries and the cross-platform wrapper's executable-bit repair, so it no longer declares an unnecessary `postinstall` lifecycle script that package-manager allowlists can block.
 - **Node 20 runtime package (`0.33.2-divebell.4`):** The npm package supports Node.js 20.19 or newer for installation and the JavaScript wrapper, while fork development and release tooling continue to use Node.js 24 and pnpm 11.
+- **Restore State save stages (`0.33.2-divebell.5`):** Initial, periodic, and close-time saves are independently configurable on each command, including commands sent to an existing daemon. Cross-origin storage collection prefers a background CDP target and retains a compatibility fallback.
 
 ## Publishing the Divebell package
 
