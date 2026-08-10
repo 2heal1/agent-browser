@@ -518,7 +518,7 @@ pub async fn sampling_stop(
     if let Some(head) = profile.get("head") {
         collect_function_summaries(head, &mut summaries);
     }
-    summaries.sort_by(|a, b| b.self_size.cmp(&a.self_size));
+    summaries.sort_by_key(|entry| std::cmp::Reverse(entry.self_size));
     let allocation_bytes: u64 = summaries.iter().map(|entry| entry.self_size).sum();
     let top_functions: Vec<Value> = summaries
         .into_iter()

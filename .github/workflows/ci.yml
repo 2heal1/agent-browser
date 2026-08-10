@@ -289,7 +289,7 @@ jobs:
       - name: Test npm global install
         run: |
           npm pack
-          npm install -g agent-browser-*.tgz
+          npm install -g *agent-browser-*.tgz
           agent-browser --version
         shell: bash
 
@@ -353,5 +353,5 @@ jobs:
         run: |
           set -euo pipefail
           prefix="$RUNNER_TEMP/node20-prefix"
-          npm install --global --prefix "$prefix" agent-browser-*.tgz
+          npm install --global --prefix "$prefix" *agent-browser-*.tgz
           "$prefix/bin/agent-browser" --version
