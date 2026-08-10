@@ -60,6 +60,10 @@ pub struct Config {
     pub session_name: Option<String>,
     pub restore: Option<String>,
     pub restore_save: Option<String>,
+    pub restore_initial_save: Option<bool>,
+    pub restore_periodic_save: Option<bool>,
+    pub restore_close_save: Option<bool>,
+    pub restore_periodic_save_interval_ms: Option<u64>,
     pub restore_check_url: Option<String>,
     pub restore_check_text: Option<String>,
     pub restore_check_fn: Option<String>,
@@ -112,6 +116,12 @@ impl Config {
             session_name: other.session_name.or(self.session_name),
             restore: other.restore.or(self.restore),
             restore_save: other.restore_save.or(self.restore_save),
+            restore_initial_save: other.restore_initial_save.or(self.restore_initial_save),
+            restore_periodic_save: other.restore_periodic_save.or(self.restore_periodic_save),
+            restore_close_save: other.restore_close_save.or(self.restore_close_save),
+            restore_periodic_save_interval_ms: other
+                .restore_periodic_save_interval_ms
+                .or(self.restore_periodic_save_interval_ms),
             restore_check_url: other.restore_check_url.or(self.restore_check_url),
             restore_check_text: other.restore_check_text.or(self.restore_check_text),
             restore_check_fn: other.restore_check_fn.or(self.restore_check_fn),
@@ -243,6 +253,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
     const FLAGS_WITH_VALUE: &[&str] = &[
         "--session",
         "--restore-save",
+        "--restore-periodic-save-interval-ms",
         "--restore-check-url",
         "--restore-check-text",
         "--restore-check-fn",
@@ -326,6 +337,10 @@ pub struct Flags {
     pub session: String,
     pub restore: Option<String>,
     pub restore_save: Option<String>,
+    pub restore_initial_save: Option<bool>,
+    pub restore_periodic_save: Option<bool>,
+    pub restore_close_save: Option<bool>,
+    pub restore_periodic_save_interval_ms: Option<u64>,
     pub restore_check_url: Option<String>,
     pub restore_check_text: Option<String>,
     pub restore_check_fn: Option<String>,
@@ -479,6 +494,24 @@ pub fn parse_flags(args: &[String]) -> Flags {
         restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
             .ok()
             .or(config.restore_save),
+        restore_initial_save: env_var_bool("AGENT_BROWSER_RESTORE_INITIAL_SAVE")
+            .or(config.restore_initial_save)
+            .or_else(|| env_var_bool("AGENT_BROWSER_RESTORE_INITIAL_SAVE_DEFAULT")),
+        restore_periodic_save: env_var_bool("AGENT_BROWSER_RESTORE_PERIODIC_SAVE")
+            .or(config.restore_periodic_save)
+            .or_else(|| env_var_bool("AGENT_BROWSER_RESTORE_PERIODIC_SAVE_DEFAULT")),
+        restore_close_save: env_var_bool("AGENT_BROWSER_RESTORE_CLOSE_SAVE")
+            .or(config.restore_close_save)
+            .or_else(|| env_var_bool("AGENT_BROWSER_RESTORE_CLOSE_SAVE_DEFAULT")),
+        restore_periodic_save_interval_ms: env::var("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(config.restore_periodic_save_interval_ms)
+            .or_else(|| {
+                env::var("AGENT_BROWSER_RESTORE_PERIODIC_SAVE_INTERVAL_MS_DEFAULT")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+            }),
         restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL")
             .ok()
             .or(config.restore_check_url),
@@ -685,6 +718,41 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--restore-save" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.restore_save = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--restore-initial-save" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.restore_initial_save = Some(val);
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--restore-periodic-save" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.restore_periodic_save = Some(val);
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--restore-close-save" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.restore_close_save = Some(val);
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--restore-periodic-save-interval-ms" => {
+                if let Some(s) = args.get(i + 1) {
+                    if let Ok(interval_ms) = s.parse::<u64>() {
+                        flags.restore_periodic_save_interval_ms = Some(interval_ms);
+                    } else {
+                        eprintln!(
+                            "{} --restore-periodic-save-interval-ms must be a non-negative integer, got '{}'",
+                            color::warning_indicator(),
+                            s
+                        );
+                    }
                     i += 1;
                 }
             }
@@ -1020,6 +1088,9 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--auto-connect",
         "--annotate",
         "--content-boundaries",
+        "--restore-initial-save",
+        "--restore-periodic-save",
+        "--restore-close-save",
         "--confirm-interactive",
         "--no-auto-dialog",
         "-v",
@@ -1035,6 +1106,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
         "--session",
         "--restore-save",
+        "--restore-periodic-save-interval-ms",
         "--restore-check-url",
         "--restore-check-text",
         "--restore-check-fn",
@@ -1433,6 +1505,10 @@ mod tests {
             "debug": true,
             "session": "test-session",
             "sessionName": "my-app",
+            "restoreInitialSave": false,
+            "restorePeriodicSave": true,
+            "restoreCloseSave": true,
+            "restorePeriodicSaveIntervalMs": 45000,
             "executablePath": "/usr/bin/chromium",
             "extensions": ["/ext1", "/ext2"],
             "profile": "/tmp/profile",
@@ -1464,6 +1540,10 @@ mod tests {
         assert_eq!(config.debug, Some(true));
         assert_eq!(config.session.as_deref(), Some("test-session"));
         assert_eq!(config.session_name.as_deref(), Some("my-app"));
+        assert_eq!(config.restore_initial_save, Some(false));
+        assert_eq!(config.restore_periodic_save, Some(true));
+        assert_eq!(config.restore_close_save, Some(true));
+        assert_eq!(config.restore_periodic_save_interval_ms, Some(45_000));
         assert_eq!(config.executable_path.as_deref(), Some("/usr/bin/chromium"));
         assert_eq!(
             config.extensions,
@@ -1692,6 +1772,89 @@ mod tests {
 
         let _ = fs::remove_file(&config_path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_restore_save_stage_priority_cli_env_config_then_caller_default() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_RESTORE_INITIAL_SAVE",
+            "AGENT_BROWSER_RESTORE_PERIODIC_SAVE",
+            "AGENT_BROWSER_RESTORE_CLOSE_SAVE",
+            "AGENT_BROWSER_RESTORE_INITIAL_SAVE_DEFAULT",
+            "AGENT_BROWSER_RESTORE_PERIODIC_SAVE_DEFAULT",
+            "AGENT_BROWSER_RESTORE_CLOSE_SAVE_DEFAULT",
+            "AGENT_BROWSER_AUTOSAVE_INTERVAL_MS",
+            "AGENT_BROWSER_RESTORE_PERIODIC_SAVE_INTERVAL_MS_DEFAULT",
+        ]);
+        for name in [
+            "AGENT_BROWSER_RESTORE_INITIAL_SAVE",
+            "AGENT_BROWSER_RESTORE_PERIODIC_SAVE",
+            "AGENT_BROWSER_RESTORE_CLOSE_SAVE",
+            "AGENT_BROWSER_AUTOSAVE_INTERVAL_MS",
+        ] {
+            guard.remove(name);
+        }
+        guard.set("AGENT_BROWSER_RESTORE_INITIAL_SAVE_DEFAULT", "true");
+        guard.set("AGENT_BROWSER_RESTORE_PERIODIC_SAVE_DEFAULT", "false");
+        guard.set("AGENT_BROWSER_RESTORE_CLOSE_SAVE_DEFAULT", "true");
+        guard.set(
+            "AGENT_BROWSER_RESTORE_PERIODIC_SAVE_INTERVAL_MS_DEFAULT",
+            "30000",
+        );
+
+        let caller_default = parse_flags(&args("--restore open example.com"));
+        assert_eq!(caller_default.restore_initial_save, Some(true));
+        assert_eq!(caller_default.restore_periodic_save, Some(false));
+        assert_eq!(caller_default.restore_close_save, Some(true));
+        assert_eq!(
+            caller_default.restore_periodic_save_interval_ms,
+            Some(30_000)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("restore-policy.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "restoreInitialSave": false,
+                "restorePeriodicSave": true,
+                "restoreCloseSave": false,
+                "restorePeriodicSaveIntervalMs": 45000
+            }"#,
+        )
+        .unwrap();
+        let config_arg = config_path.to_string_lossy();
+
+        let configured = parse_flags(&args(&format!(
+            "--config {} --restore open example.com",
+            config_arg
+        )));
+        assert_eq!(configured.restore_initial_save, Some(false));
+        assert_eq!(configured.restore_periodic_save, Some(true));
+        assert_eq!(configured.restore_close_save, Some(false));
+        assert_eq!(configured.restore_periodic_save_interval_ms, Some(45_000));
+
+        guard.set("AGENT_BROWSER_RESTORE_INITIAL_SAVE", "true");
+        guard.set("AGENT_BROWSER_RESTORE_PERIODIC_SAVE", "false");
+        guard.set("AGENT_BROWSER_RESTORE_CLOSE_SAVE", "true");
+        guard.set("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS", "60000");
+        let environment = parse_flags(&args(&format!(
+            "--config {} --restore open example.com",
+            config_arg
+        )));
+        assert_eq!(environment.restore_initial_save, Some(true));
+        assert_eq!(environment.restore_periodic_save, Some(false));
+        assert_eq!(environment.restore_close_save, Some(true));
+        assert_eq!(environment.restore_periodic_save_interval_ms, Some(60_000));
+
+        let cli = parse_flags(&args(&format!(
+            "--config {} --restore --restore-initial-save false --restore-periodic-save true --restore-close-save false --restore-periodic-save-interval-ms 15000 open example.com",
+            config_arg
+        )));
+        assert_eq!(cli.restore_initial_save, Some(false));
+        assert_eq!(cli.restore_periodic_save, Some(true));
+        assert_eq!(cli.restore_close_save, Some(false));
+        assert_eq!(cli.restore_periodic_save_interval_ms, Some(15_000));
     }
 
     // === Boolean flag value tests ===

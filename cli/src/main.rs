@@ -188,6 +188,18 @@ fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) 
     if let Some(restore_key) = restore_key_from_flags(flags) {
         cmd["restoreKey"] = json!(restore_key);
         cmd["restoreSave"] = json!(flags.restore_save.as_deref().unwrap_or("auto"));
+        if let Some(enabled) = flags.restore_initial_save {
+            cmd["restoreInitialSave"] = json!(enabled);
+        }
+        if let Some(enabled) = flags.restore_periodic_save {
+            cmd["restorePeriodicSave"] = json!(enabled);
+        }
+        if let Some(enabled) = flags.restore_close_save {
+            cmd["restoreCloseSave"] = json!(enabled);
+        }
+        if let Some(interval_ms) = flags.restore_periodic_save_interval_ms {
+            cmd["restorePeriodicSaveIntervalMs"] = json!(interval_ms);
+        }
         cmd["restoreCheckUrl"] = flags
             .restore_check_url
             .as_ref()
@@ -2021,6 +2033,14 @@ mod tests {
             "--restore".to_string(),
             "--restore-save".to_string(),
             "always".to_string(),
+            "--restore-initial-save".to_string(),
+            "false".to_string(),
+            "--restore-periodic-save".to_string(),
+            "true".to_string(),
+            "--restore-close-save".to_string(),
+            "true".to_string(),
+            "--restore-periodic-save-interval-ms".to_string(),
+            "45000".to_string(),
             "--restore-check-url".to_string(),
             "**/dashboard".to_string(),
             "--restore-check-text".to_string(),
@@ -2040,6 +2060,10 @@ mod tests {
 
         assert_eq!(cmd["restoreKey"], "next-loop");
         assert_eq!(cmd["restoreSave"], "always");
+        assert_eq!(cmd["restoreInitialSave"], false);
+        assert_eq!(cmd["restorePeriodicSave"], true);
+        assert_eq!(cmd["restoreCloseSave"], true);
+        assert_eq!(cmd["restorePeriodicSaveIntervalMs"], 45_000);
         assert_eq!(cmd["restoreCheckUrl"], "**/dashboard");
         assert_eq!(cmd["restoreCheckText"], "Dashboard");
         assert_eq!(cmd["restoreCheckFn"], "!!localStorage.getItem('session')");
@@ -2064,6 +2088,10 @@ mod tests {
 
         assert_eq!(cmd["restoreKey"], "next-loop");
         assert_eq!(cmd["restoreSave"], "auto");
+        assert!(cmd.get("restoreInitialSave").is_none());
+        assert!(cmd.get("restorePeriodicSave").is_none());
+        assert!(cmd.get("restoreCloseSave").is_none());
+        assert!(cmd.get("restorePeriodicSaveIntervalMs").is_none());
         assert!(cmd["restoreCheckUrl"].is_null());
         assert!(cmd["restoreCheckText"].is_null());
         assert!(cmd["restoreCheckFn"].is_null());

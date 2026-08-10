@@ -1950,6 +1950,35 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "restoreInitialSave".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Save once after a newly launched page has been quiet for about two seconds."
+        }),
+    );
+    props.insert(
+        "restorePeriodicSave".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Continue saving restored state periodically while the browser remains open."
+        }),
+    );
+    props.insert(
+        "restoreCloseSave".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Save the latest restored state before close, shutdown, or relaunch."
+        }),
+    );
+    props.insert(
+        "restorePeriodicSaveIntervalMs".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "Minimum milliseconds between periodic restore-state saves. Zero disables only the periodic stage."
+        }),
+    );
+    props.insert(
         "restoreCheckUrl".to_string(),
         json!({
             "type": "string",
@@ -3707,6 +3736,28 @@ fn append_common_global_args(
         args.push("--restore-save".to_string());
         args.push(policy);
     }
+    for (property, flag) in [
+        ("restoreInitialSave", "--restore-initial-save"),
+        ("restorePeriodicSave", "--restore-periodic-save"),
+        ("restoreCloseSave", "--restore-close-save"),
+    ] {
+        if let Some(value) = arguments.get(property) {
+            let enabled = value.as_bool().ok_or_else(|| {
+                ProtocolError::invalid_params(format!("{} must be a boolean", property))
+            })?;
+            args.push(flag.to_string());
+            args.push(enabled.to_string());
+        }
+    }
+    if let Some(value) = arguments.get("restorePeriodicSaveIntervalMs") {
+        let interval_ms = value.as_u64().ok_or_else(|| {
+            ProtocolError::invalid_params(
+                "restorePeriodicSaveIntervalMs must be a non-negative integer",
+            )
+        })?;
+        args.push("--restore-periodic-save-interval-ms".to_string());
+        args.push(interval_ms.to_string());
+    }
     if let Some(check) = optional_string(arguments, "restoreCheckUrl")? {
         args.push("--restore-check-url".to_string());
         args.push(check);
@@ -4387,6 +4438,37 @@ mod tests {
     }
 
     #[test]
+    fn common_global_args_include_restore_save_stages() {
+        let mut args = Vec::new();
+
+        append_common_global_args(
+            &mut args,
+            &json!({
+                "restoreInitialSave": false,
+                "restorePeriodicSave": true,
+                "restoreCloseSave": true,
+                "restorePeriodicSaveIntervalMs": 45000
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "--restore-initial-save",
+                "false",
+                "--restore-periodic-save",
+                "true",
+                "--restore-close-save",
+                "true",
+                "--restore-periodic-save-interval-ms",
+                "45000"
+            ]
+        );
+    }
+
+    #[test]
     fn tool_schema_includes_extra_args_for_cli_parity() {
         let tools = tools();
         let open = tools
@@ -4400,6 +4482,18 @@ mod tests {
         assert_eq!(
             open["inputSchema"]["properties"]["restoreSave"]["enum"][0],
             "auto"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["restoreInitialSave"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["restorePeriodicSave"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["restoreCloseSave"]["type"],
+            "boolean"
         );
         assert_eq!(
             open["inputSchema"]["properties"]["namespace"]["type"],

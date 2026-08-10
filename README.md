@@ -747,7 +747,7 @@ The profile directory stores:
 
 ## Session Persistence
 
-Use `--restore` with a stable `--session` to automatically save and restore cookies and localStorage across browser restarts:
+Use `--restore` with a stable `--session` to automatically save and restore cookies, localStorage, and sessionStorage across browser restarts. Restore State is a portable storage snapshot, not a complete Chrome Profile. A Profile also keeps IndexedDB, service workers, cache, extensions, browser preferences, and other Chrome-owned data.
 
 ```bash
 # Generate a stable id for this worktree and auto-save/load state
@@ -761,7 +761,11 @@ agent-browser --session "$SESSION" --restore open twitter.com
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open twitter.com
 ```
 
-State is saved when the browser closes (explicit `close`, idle timeout, or daemon shutdown) and also periodically while the browser is open, so a browser window you close by hand still leaves a recent save behind. Periodic autosave waits for commands to settle, then saves at most once per `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` (default 30000; set to `0` to save only on close). Idle sessions keep saving on the same interval, so changes the page makes on its own (token refreshes, background requests) are captured too. It respects the `--restore-save` policy.
+The three save stages are independent. By default, agent-browser saves once after a newly launched page has been quiet for about two seconds, continues periodically while the browser is open, and saves again before explicit `close`, idle timeout, daemon shutdown, or a compatible relaunch. Disable a stage with `--restore-initial-save false`, `--restore-periodic-save false`, or `--restore-close-save false`. Periodic saves run at most once per `--restore-periodic-save-interval-ms` or `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` (default 30000); an interval of `0` disables only the periodic stage.
+
+Collecting localStorage and sessionStorage from more than one origin requires a disposable CDP target. agent-browser asks compatible browsers to create that target in the background and falls back when the CDP implementation does not support that option. In a headed browser that uses the fallback, an initial or periodic save can briefly show the temporary target. The original page is not refreshed. Disable only the post-launch save with `--restore-initial-save false` when this visual switch is undesirable; close saving remains enabled.
+
+`--restore-save auto|always|never` remains the higher-level safety policy. `auto` skips saving after restore or validation failure, `always` permits saving despite those failures, and `never` disables every stage. In contrast, disabling initial or periodic saving still preserves close-time saving unless `--restore-close-save false` is also set.
 
 ### State Encryption
 
@@ -779,7 +783,10 @@ agent-browser --session secure --restore open example.com
 | --------------------------------- | -------------------------------------------------- |
 | `AGENT_BROWSER_RESTORE`           | Auto-save/load state persistence name              |
 | `AGENT_BROWSER_RESTORE_SAVE`      | Restore save policy: `auto`, `always`, or `never`  |
-| `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` | Min ms between periodic autosaves (default: 30000, 0 disables) |
+| `AGENT_BROWSER_RESTORE_INITIAL_SAVE` | Enable the one-time post-launch save (default: true) |
+| `AGENT_BROWSER_RESTORE_PERIODIC_SAVE` | Enable periodic saves while open (default: true) |
+| `AGENT_BROWSER_RESTORE_CLOSE_SAVE` | Enable saves before close, shutdown, and relaunch (default: true) |
+| `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` | Min ms between periodic saves (default: 30000; 0 disables periodic only) |
 | `AGENT_BROWSER_NAMESPACE`         | Namespace for daemon sockets and restore state     |
 | `AGENT_BROWSER_SESSION_NAME`      | Legacy auto-save/load state persistence name       |
 | `AGENT_BROWSER_ENCRYPTION_KEY`    | 64-char hex key for AES-256-GCM encryption         |
@@ -948,6 +955,10 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--session <name>` | Use isolated session (or `AGENT_BROWSER_SESSION` env) |
 | `--restore [name]` | Auto-save/restore session state. Bare `--restore` uses `--session` as the key |
 | `--restore-save <policy>` | Restore save policy: `auto`, `always`, or `never` |
+| `--restore-initial-save <bool>` | Save once after the page is quiet for about two seconds (default: true) |
+| `--restore-periodic-save <bool>` | Continue saving periodically while open (default: true) |
+| `--restore-close-save <bool>` | Save before close, shutdown, or relaunch (default: true) |
+| `--restore-periodic-save-interval-ms <ms>` | Minimum periodic save interval (default: 30000; 0 disables periodic only) |
 | `--restore-check-url <glob>` | Validate restored state against a URL pattern |
 | `--restore-check-text <text>` | Validate restored state against page text |
 | `--restore-check-fn <js>` | Validate restored state against a truthy JavaScript expression |

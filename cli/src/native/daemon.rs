@@ -131,8 +131,6 @@ pub async fn run_daemon(session: &str) {
     // shutdown entirely.
     let idle_timeout = resolve_idle_timeout(env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS").ok());
 
-    let autosave_interval_ms = autosave_interval_ms_from_env();
-
     let result = run_socket_server(
         &socket_path,
         session,
@@ -140,7 +138,6 @@ pub async fn run_daemon(session: &str) {
         stream_server_instance,
         idle_activity,
         idle_timeout,
-        autosave_interval_ms,
     )
     .await;
 
@@ -208,15 +205,6 @@ fn remaining_idle_timeout(activity: &IdleActivity, timeout_ms: u64) -> Option<Du
     Duration::from_millis(timeout_ms).checked_sub(activity.elapsed())
 }
 
-/// Minimum ms between periodic session autosaves while the browser is open.
-/// Defaults to 30s; 0 disables periodic autosave (save-on-close still runs).
-fn autosave_interval_ms_from_env() -> u64 {
-    env::var("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30_000)
-}
-
 #[cfg(unix)]
 async fn run_socket_server(
     socket_path: &PathBuf,
@@ -225,7 +213,6 @@ async fn run_socket_server(
     stream_server: Option<Arc<StreamServer>>,
     idle_activity: Arc<IdleActivity>,
     idle_timeout: Option<IdleTimeout>,
-    autosave_interval_ms: u64,
 ) -> Result<(), String> {
     use tokio::net::UnixListener;
 
@@ -301,7 +288,7 @@ async fn run_socket_server(
                             error
                         );
                     } else {
-                        maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                        maybe_autosave_restore_state(&mut s).await;
                     }
                 }
             }
@@ -375,7 +362,6 @@ async fn run_socket_server(
     stream_server: Option<Arc<StreamServer>>,
     idle_activity: Arc<IdleActivity>,
     idle_timeout: Option<IdleTimeout>,
-    autosave_interval_ms: u64,
 ) -> Result<(), String> {
     use tokio::net::TcpListener;
 
@@ -459,7 +445,7 @@ async fn run_socket_server(
                     let _ = close_current_browser(&mut s).await;
                 } else if s.browser.is_some() {
                     s.drain_cdp_events_background().await;
-                    maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
+                    maybe_autosave_restore_state(&mut s).await;
                 }
             }
             _ = async {

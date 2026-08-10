@@ -138,15 +138,31 @@ async fn collect_storage_via_temp_target(
     origins: &[String],
     origin_js: &str,
 ) -> Result<Vec<OriginStorage>, String> {
-    let create_result: CreateTargetResult = client
+    // Prefer a background target so headed sessions do not visibly switch
+    // away from the user's page while cross-origin storage is collected.
+    // Older CDP implementations may reject the experimental `background`
+    // field, so retry with the broadly supported request shape.
+    let create_result: CreateTargetResult = match client
         .send_command_typed(
             "Target.createTarget",
-            &CreateTargetParams {
-                url: "about:blank".to_string(),
-            },
+            &json!({ "url": "about:blank", "background": true }),
             None,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            client
+                .send_command_typed(
+                    "Target.createTarget",
+                    &CreateTargetParams {
+                        url: "about:blank".to_string(),
+                    },
+                    None,
+                )
+                .await?
+        }
+    };
 
     let target_id = create_result.target_id;
 
