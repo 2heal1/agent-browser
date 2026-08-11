@@ -15,6 +15,8 @@ pub mod coverage;
 #[allow(dead_code)]
 pub mod daemon;
 #[allow(dead_code)]
+pub mod debugger;
+#[allow(dead_code)]
 pub mod diff;
 #[allow(dead_code)]
 pub mod element;

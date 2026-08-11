@@ -12,13 +12,16 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Notify;
 
 use crate::test_utils::EnvGuard;
 
 use super::actions::{
     close_current_browser, execute_command, maybe_autosave_restore_state, DaemonState,
 };
+use super::daemon::handle_connection;
+use super::stream::IdleActivity;
 
 fn assert_success(resp: &Value) {
     assert_eq!(
@@ -40,6 +43,7 @@ fn native_test_fixture_html(name: &str) -> &'static str {
         "pointer_capture_probe" => include_str!("test_fixtures/pointer_capture_probe.html"),
         "upload_probe" => include_str!("test_fixtures/upload_probe.html"),
         "memory_probe" => include_str!("test_fixtures/memory_probe.html"),
+        "debugger_probe" => include_str!("test_fixtures/debugger_probe.html"),
         _ => panic!("Unknown native test fixture: {}", name),
     }
 }
@@ -228,6 +232,331 @@ fn native_test_fixture_url(name: &str) -> String {
         "data:text/html;base64,{}",
         STANDARD.encode(native_test_fixture_html(name))
     )
+}
+
+async fn debugger_fast_command(
+    state: Arc<tokio::sync::Mutex<DaemonState>>,
+    memory_state: super::memory::MemoryState,
+    debugger: Arc<super::debugger::DebuggerController>,
+    command: Value,
+) -> Value {
+    let (client, server) = tokio::io::duplex(128 * 1024);
+    let task = tokio::spawn(handle_connection(
+        server,
+        state,
+        memory_state,
+        debugger,
+        Arc::new(IdleActivity::new()),
+        None,
+        Arc::new(Notify::new()),
+    ));
+    let (reader, mut writer) = tokio::io::split(client);
+    let mut reader = BufReader::new(reader);
+    let mut encoded = serde_json::to_vec(&command).unwrap();
+    encoded.push(b'\n');
+    writer.write_all(&encoded).await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("debugger fast command timed out")
+    .unwrap();
+    task.abort();
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_debugger_second_connection_recovers_paused_first_connection_and_logs() {
+    let mut state = DaemonState::new();
+    let launch = execute_command(
+        &json!({
+            "id": "debug-1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&launch);
+    let navigate = execute_command(
+        &json!({
+            "id": "debug-2",
+            "action": "navigate",
+            "url": native_test_fixture_url("debugger_probe")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&navigate);
+
+    let debugger = state.debugger.clone();
+    let enable = debugger
+        .execute_fast(&json!({ "id": "debug-3", "action": "debug_enable" }))
+        .await;
+    assert_success(&enable);
+
+    let script_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let scripts = debugger
+                .execute_fast(&json!({
+                    "id": "debug-4",
+                    "action": "debug_scripts",
+                    "filter": "debugger-probe.js"
+                }))
+                .await;
+            if let Some(script_id) = get_data(&scripts)["scripts"]
+                .as_array()
+                .and_then(|scripts| scripts.first())
+                .and_then(|script| script["scriptId"].as_str())
+            {
+                break script_id.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("debugger script was not registered");
+
+    let search = debugger
+        .execute_fast(&json!({
+            "id": "debug-5",
+            "action": "debug_source_search",
+            "query": "return value * 2",
+            "filter": "debugger-probe.js"
+        }))
+        .await;
+    assert_success(&search);
+    let line = get_data(&search)["matches"][0]["line"]
+        .as_u64()
+        .expect("probe source line");
+    let breakpoint = debugger
+        .execute_fast(&json!({
+            "id": "debug-6",
+            "action": "debug_breakpoint_set",
+            "scriptId": script_id,
+            "line": line,
+            "mode": "strict"
+        }))
+        .await;
+    assert_success(&breakpoint);
+    let breakpoint_probe_id = get_data(&breakpoint)["probeId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let memory_state = state.memory_state.clone();
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    let (evaluate_client, evaluate_server) = tokio::io::duplex(128 * 1024);
+    let evaluate_task = tokio::spawn(handle_connection(
+        evaluate_server,
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        Arc::new(IdleActivity::new()),
+        None,
+        Arc::new(Notify::new()),
+    ));
+    let (evaluate_reader, mut evaluate_writer) = tokio::io::split(evaluate_client);
+    let mut evaluate_reader = BufReader::new(evaluate_reader);
+    evaluate_writer
+        .write_all(
+            b"{\"id\":\"debug-7\",\"action\":\"evaluate\",\"script\":\"debuggerProbe(21)\"}\n",
+        )
+        .await
+        .unwrap();
+
+    let pause = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = debugger_fast_command(
+                state.clone(),
+                memory_state.clone(),
+                debugger.clone(),
+                json!({ "id": "debug-8", "action": "debug_status" }),
+            )
+            .await;
+            if get_data(&status)["paused"].as_bool() == Some(true) {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("breakpoint did not pause");
+    assert_eq!(
+        get_data(&pause)["pauses"][0]["probeIds"][0],
+        breakpoint_probe_id
+    );
+
+    let stack = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({ "id": "debug-9", "action": "debug_stack" }),
+    )
+    .await;
+    assert_success(&stack);
+    assert!(get_data(&stack)["callFrames"]
+        .as_array()
+        .is_some_and(|frames| !frames.is_empty()));
+    let resume = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({ "id": "debug-10", "action": "debug_resume" }),
+    )
+    .await;
+    assert_success(&resume);
+
+    let mut evaluate_line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        evaluate_reader.read_line(&mut evaluate_line),
+    )
+    .await
+    .expect("first connection did not recover after resume")
+    .unwrap();
+    let evaluate: Value = serde_json::from_str(evaluate_line.trim()).unwrap();
+    assert_success(&evaluate);
+    assert_eq!(get_data(&evaluate)["result"], 42);
+    evaluate_task.abort();
+
+    let removed = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({
+            "id": "debug-11",
+            "action": "debug_breakpoint_remove",
+            "probeId": breakpoint_probe_id
+        }),
+    )
+    .await;
+    assert_success(&removed);
+    let cursor = get_data(
+        &debugger_fast_command(
+            state.clone(),
+            memory_state.clone(),
+            debugger.clone(),
+            json!({ "id": "debug-12", "action": "debug_events" }),
+        )
+        .await,
+    )["latestSequence"]
+        .as_u64()
+        .unwrap_or(0);
+    let logpoint = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({
+            "id": "debug-13",
+            "action": "debug_logpoint_set",
+            "scriptId": script_id,
+            "line": line,
+            "mode": "strict",
+            "when": "value > 0",
+            "expressions": ["state", "10n", "missing.value"]
+        }),
+    )
+    .await;
+    assert_success(&logpoint);
+    let logpoint_probe_id = get_data(&logpoint)["probeId"].as_str().unwrap().to_string();
+    let when_search = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({
+            "id": "debug-13a",
+            "action": "debug_source_search",
+            "query": "state.circular = state",
+            "filter": "debugger-probe.js"
+        }),
+    )
+    .await;
+    assert_success(&when_search);
+    let when_line = get_data(&when_search)["matches"][0]["line"]
+        .as_u64()
+        .expect("throwing when source line");
+    let throwing_when = debugger_fast_command(
+        state.clone(),
+        memory_state.clone(),
+        debugger.clone(),
+        json!({
+            "id": "debug-13b",
+            "action": "debug_logpoint_set",
+            "scriptId": script_id,
+            "line": when_line,
+            "mode": "strict",
+            "when": "missing.ready",
+            "expressions": ["state"]
+        }),
+    )
+    .await;
+    assert_success(&throwing_when);
+    let throwing_when_probe_id = get_data(&throwing_when)["probeId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let logged_eval = {
+        let mut state = state.lock().await;
+        execute_command(
+            &json!({ "id": "debug-14", "action": "evaluate", "script": "debuggerProbe(7)" }),
+            &mut state,
+        )
+        .await
+    };
+    assert_success(&logged_eval);
+    let events = debugger_fast_command(
+        state.clone(),
+        memory_state,
+        debugger.clone(),
+        json!({
+            "id": "debug-15",
+            "action": "debug_events",
+            "since": cursor,
+            "wait": 2000
+        }),
+    )
+    .await;
+    assert_success(&events);
+    let events = get_data(&events)["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| {
+        event["type"] == "logpoint-hit"
+            && event["data"]["probeId"] == logpoint_probe_id
+            && event["data"]["values"][0]["value"]["label"] == "调试-probe"
+            && event["data"]["values"][0]["value"]["circular"]["type"] == "circular"
+            && event["data"]["values"][1]["value"]["type"] == "bigint"
+            && event["data"]["values"][2]["evaluationError"].is_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "logpoint-hit"
+            && event["data"]["probeId"] == throwing_when_probe_id
+            && event["data"]["whenError"].is_string()
+            && event["data"]["values"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+    }));
+
+    let mut state = state.lock().await;
+    close_current_browser(&mut state).await.unwrap();
+    drop(state);
+    let status = debugger
+        .execute_fast(&json!({ "id": "debug-16", "action": "debug_status" }))
+        .await;
+    assert_success(&status);
+    assert_eq!(get_data(&status)["paused"], false);
+    assert_eq!(get_data(&status)["sessions"], json!([]));
+    let probes = debugger
+        .execute_fast(&json!({ "id": "debug-17", "action": "debug_logpoint_list" }))
+        .await;
+    assert_success(&probes);
+    assert!(get_data(&probes)["probes"]
+        .as_array()
+        .is_some_and(|probes| probes.iter().all(|probe| probe["bindings"] == json!([]))));
 }
 
 async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_value: &str) {

@@ -25,6 +25,7 @@ use super::cdp::types::{
 };
 use super::cookies;
 use super::coverage::{self, CoverageState};
+use super::debugger::DebuggerController;
 use super::diff;
 use super::element::RefMap;
 use super::inspect_server::InspectServer;
@@ -383,6 +384,9 @@ pub struct DaemonState {
     pub memory_state: MemoryState,
     /// Shared lifecycle state for JavaScript precise coverage checkpoints.
     pub coverage_state: CoverageState,
+    /// Lock-independent debugger control plane. It remains responsive while
+    /// an ordinary command is waiting on a renderer paused by JavaScript.
+    pub debugger: Arc<DebuggerController>,
     pub recording_state: RecordingState,
     event_rx: Option<broadcast::Receiver<CdpEvent>>,
     pub screencasting: bool,
@@ -543,6 +547,7 @@ impl DaemonState {
             tracing_state: TracingState::new(),
             memory_state: MemoryState::new(),
             coverage_state: CoverageState::new(),
+            debugger: Arc::new(DebuggerController::new()),
             recording_state: RecordingState::new(),
             event_rx: None,
             screencasting: false,
@@ -642,6 +647,11 @@ impl DaemonState {
     fn subscribe_to_browser_events(&mut self) {
         if let Some(ref browser) = self.browser {
             self.event_rx = Some(browser.client.subscribe());
+            self.debugger.attach_browser(
+                browser.client.clone(),
+                browser.pages_list(),
+                browser.active_tab_id(),
+            );
         }
     }
 
@@ -1310,6 +1320,11 @@ impl DaemonState {
 
         if active_frame_scope_changed {
             self.refresh_active_iframe_sessions().await;
+        }
+
+        if let Some(ref browser) = self.browser {
+            self.debugger
+                .sync_pages(browser.pages_list(), browser.active_tab_id());
         }
 
         Ok(())
@@ -2063,6 +2078,7 @@ async fn close_active_provider_session(state: &mut DaemonState) {
 }
 
 pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+    state.debugger.detach_browser("browser-closed");
     if let (Some(capture), Some(mgr)) =
         (state.memory_state.active_capture(), state.browser.as_ref())
     {
@@ -2267,6 +2283,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Direct callers such as batch execution, tests, and embedders do not go
+    // through the daemon connection router. Preserve CLI/MCP parity by
+    // delegating debugger actions to the same independent controller here.
+    if DebuggerController::is_fast_action(action) {
+        return state.debugger.execute_fast(cmd).await;
+    }
 
     let cmd_start = std::time::Instant::now();
 
@@ -2509,6 +2532,31 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 &format!(
                     "A JavaScript {} dialog is blocking the page: \"{}\". Resolve it with `dialog accept` or `dialog dismiss`, then retry `{}`.",
                     dialog.dialog_type, dialog.message, action
+                ),
+            );
+        }
+    }
+
+    // Renderer-bound commands do not complete while JavaScript is paused.
+    // The debugger control plane bypasses this function entirely, while tab
+    // management remains available when no earlier command owns the daemon
+    // lock. Fail other commands immediately instead of misreporting a dead
+    // renderer or waiting for the IPC timeout.
+    if let Some(pause) = state.debugger.active_tab_paused() {
+        let safe_during_debug_pause = matches!(
+            action,
+            "tab_list" | "tab_new" | "tab_switch" | "tab_close" | "close" | "session_info"
+        );
+        if !safe_during_debug_pause {
+            let pause_id = pause
+                .get("pauseId")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return error_response(
+                &id,
+                &format!(
+                    "JavaScript is paused on the active tab (pause ID {}). Inspect it with `debug stack` or continue with `debug resume` before retrying `{}`.",
+                    pause_id, action
                 ),
             );
         }
@@ -3271,6 +3319,7 @@ async fn auto_launch(
     }
 
     state.engine = engine.as_deref().unwrap_or("chrome").to_string();
+    state.debugger.set_engine(&state.engine);
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file(&state.session_id);
 
@@ -4409,6 +4458,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     }
 
     state.engine = engine.as_deref().unwrap_or("chrome").to_string();
+    state.debugger.set_engine(&state.engine);
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
     state.reset_input_state();
@@ -4465,6 +4515,7 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     state.appium = Some(appium);
     state.backend_type = BackendType::WebDriver;
     state.engine = "safari".to_string();
+    state.debugger.set_engine(&state.engine);
     write_engine_file(&state.session_id, &state.engine);
     write_provider_file(&state.session_id, "ios");
     write_extensions_file(&state.session_id);
@@ -4513,6 +4564,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.webdriver_backend = Some(WebDriverBackend::new(client));
     state.backend_type = BackendType::WebDriver;
     state.engine = "safari".to_string();
+    state.debugger.set_engine(&state.engine);
     write_engine_file(&state.session_id, &state.engine);
     write_provider_file(&state.session_id, "safari");
     write_extensions_file(&state.session_id);
@@ -6304,10 +6356,15 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .pending_dialog
         .as_ref()
         .and_then(|d| d.session_id.clone());
+    let debugger_paused_sessions = state.debugger.paused_session_ids();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
-            .await?
+        mgr.tab_switch_by_id(
+            tab_id,
+            dialog_session.as_deref(),
+            Some(&debugger_paused_sessions),
+        )
+        .await?
     };
     // Clear only after the switch commits, so a failed switch does not strand
     // the user on the old tab with dead refs and frame scope.
@@ -6322,9 +6379,10 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     // A dialog-blocked tab's renderer is paused and cannot answer an eval, so
     // skip the viewport sync; it would otherwise stall on the CDP timeout. The
     // sync resumes on the next command once the dialog is resolved.
-    let dialog_blocked = result.get("dialogBlocked").and_then(|v| v.as_bool()) == Some(true);
+    let main_thread_blocked = result.get("dialogBlocked").and_then(|v| v.as_bool()) == Some(true)
+        || result.get("debuggerPaused").and_then(|v| v.as_bool()) == Some(true);
     if let Some(ref server) = state.stream_server {
-        if let Some(mgr) = state.browser.as_ref().filter(|_| !dialog_blocked) {
+        if let Some(mgr) = state.browser.as_ref().filter(|_| !main_thread_blocked) {
             if let Ok(dims) = mgr
                 .evaluate(
                     "JSON.stringify([window.innerWidth,window.innerHeight])",
@@ -6361,10 +6419,15 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         .pending_dialog
         .as_ref()
         .and_then(|d| d.session_id.clone());
+    let debugger_paused_sessions = state.debugger.paused_session_ids();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.tab_close_by_id(tab_id, dialog_session.as_deref())
-            .await?
+        mgr.tab_close_by_id(
+            tab_id,
+            dialog_session.as_deref(),
+            Some(&debugger_paused_sessions),
+        )
+        .await?
     };
     // Clear only after the close commits; a rejected close (last tab, bad
     // index) must not wipe the caller's refs and frame scope.

@@ -229,7 +229,7 @@ agent-browser tab close docs             # close by label
 
 Labels are never auto-generated, never rewritten on navigation, and must be unique within a session. To interact with another tab, switch to it first: the daemon maintains a single active tab, so refs (`@eN`) belong to the tab that was active when the snapshot ran.
 
-Switching to a tab that the browser discarded to save memory reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the page and resets its unsaved state, and the switch result adds `"revived": true` so the reload is not silent. A tab whose page is paused by a JavaScript dialog is alive rather than discarded: the switch leaves it untouched and adds `"dialogBlocked": true`. Resolve the dialog with `dialog accept`/`dialog dismiss` and its state is preserved. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
+Switching to a tab that the browser discarded to save memory reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the page and resets its unsaved state, and the switch result adds `"revived": true` so the reload is not silent. A tab whose page is paused by a JavaScript dialog or debugger is alive rather than discarded: the switch leaves it untouched and adds `"dialogBlocked": true` or `"debuggerPaused": true`. Resolve the dialog or resume the debugger and its state is preserved. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
 
 ## Frames
 
@@ -356,7 +356,7 @@ Profiles:
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
 - `network` - Network routes, request inspection, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` - Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `debug` - Compiled JavaScript breakpoints, logpoints, pause recovery, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
@@ -417,6 +417,39 @@ agent-browser trace stop trace.json       # Stop and save trace
 agent-browser profiler start              # Start Chrome DevTools profiling
 agent-browser profiler stop trace.json    # Stop and save profile
 ```
+
+### Compiled JavaScript debugger
+
+```bash
+agent-browser debug enable [--tab <tN> | --session <id>] [--all-tabs]
+agent-browser debug disable [selectors] [--all-tabs] [--resume]
+agent-browser debug status [--tab <tN> | --session <id> | --pause-id <id>]
+agent-browser debug scripts [--filter <url>] [--tab <tN> | --session <id>]
+agent-browser debug source <script-id> [selectors]
+agent-browser debug source search <text> [--filter <url>] [--max-results <count>]
+agent-browser debug breakpoint set <script-id> <line> [--column <n>] [--condition <js>] [--strict | --before | --after | --nearest] [--max-lines <n>] [--max-utf16-distance <n>] [--persist] [--tag <key=value>]
+agent-browser debug breakpoint list
+agent-browser debug breakpoint remove <probe-id>
+agent-browser debug logpoint set <script-id> <line> --expression <js>... [--when <js>] [--column <n>] [--strict | --before | --after | --nearest] [--max-lines <n>] [--max-utf16-distance <n>] [--persist] [--tag <key=value>]
+agent-browser debug logpoint list
+agent-browser debug logpoint remove <probe-id>
+agent-browser debug pause [selectors]
+agent-browser debug resume [pause selectors]
+agent-browser debug step-over|step-into|step-out [pause selectors]
+agent-browser debug stack [pause selectors]
+agent-browser debug eval <expression> [--frame <index> | --call-frame-id <id>] [pause selectors]
+agent-browser debug events [--since <sequence>] [--wait <ms>] [--clear]
+```
+
+All locations are one-based. Columns count UTF-16 code units. `--strict` requires the requested line and, when explicitly supplied, the exact column. `--after` is the default. `--before`, `--after`, and `--nearest` use `Debugger.getPossibleBreakpoints` with verified function boundaries, a default three-line bound, and a default 512 UTF-16 code unit distance. `--nearest-forward` remains a compatibility alias for `--after`.
+
+Debugger pause inspection and control are lock-independent. A second CLI or MCP request can use `status`, `stack`, frame `eval`, step, or `resume` while an ordinary command is blocked at a breakpoint. With multiple paused sessions, pause selectors are mandatory.
+
+Logpoints never use the page console as their authoritative channel. They call a random per-connection private Runtime binding with a connection nonce and physical binding ID. Values are serialized with depth, collection, string, and 64 KiB total payload limits. Cycles, accessors, getters, proxies, functions, symbols, `BigInt`, and non-finite numbers are represented safely. `--when` failures and individual expression failures are reported separately. Registry metadata is not trusted from the page payload.
+
+`debug events` is a persistent per-daemon ring capped at 10,000 events and 8 MiB. Use `latestSequence` as the next `--since` cursor. `bufferGap` and `droppedThroughSequence` report ring eviction. `transportGap`, `lastTransportGapSequence`, and the `transport-gap` event report CDP listener lag. The aggregate `gap` field is true for either condition.
+
+See [debugging-compiled-js.md](debugging-compiled-js.md) for the identity model, lifecycle invalidation, HMR rebinding constraints, Module Federation ownership boundaries, and MCP tool mapping.
 
 ## Memory diagnostics
 

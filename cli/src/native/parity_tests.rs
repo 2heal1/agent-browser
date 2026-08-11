@@ -94,6 +94,26 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "trace_stop",
     "profiler_start",
     "profiler_stop",
+    "debug_enable",
+    "debug_disable",
+    "debug_status",
+    "debug_scripts",
+    "debug_source",
+    "debug_source_search",
+    "debug_breakpoint_set",
+    "debug_breakpoint_list",
+    "debug_breakpoint_remove",
+    "debug_logpoint_set",
+    "debug_logpoint_list",
+    "debug_logpoint_remove",
+    "debug_pause",
+    "debug_resume",
+    "debug_step_over",
+    "debug_step_into",
+    "debug_step_out",
+    "debug_stack",
+    "debug_eval",
+    "debug_events",
     "recording_start",
     "recording_stop",
     "recording_restart",
@@ -208,6 +228,20 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "evaluate" | "expose" => {
             obj.insert("script".to_string(), json!("1"));
+        }
+        "debug_source" | "debug_breakpoint_set" | "debug_logpoint_set" => {
+            obj.insert("scriptId".to_string(), json!("1"));
+            obj.insert("line".to_string(), json!(1));
+            obj.insert("expressions".to_string(), json!(["1"]));
+        }
+        "debug_source_search" => {
+            obj.insert("query".to_string(), json!("test"));
+        }
+        "debug_breakpoint_remove" | "debug_logpoint_remove" => {
+            obj.insert("probeId".to_string(), json!("probe-1"));
+        }
+        "debug_eval" => {
+            obj.insert("expression".to_string(), json!("1"));
         }
         "click" | "dblclick" | "fill" | "type" | "press" | "hover" | "scroll" | "select"
         | "check" | "uncheck" | "gettext" | "getattribute" | "isvisible" | "isenabled"

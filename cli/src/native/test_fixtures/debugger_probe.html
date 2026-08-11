@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Compiled JavaScript debugger probe</title>
+  </head>
+  <body>
+    <main>Compiled JavaScript debugger probe</main>
+    <script>
+      function debuggerProbe(value) {
+        const state = { label: "调试-probe", value };
+        state.circular = state;
+        return value * 2;
+      }
+
+      //# sourceURL=debugger-probe.js
+    </script>
+  </body>
+</html>

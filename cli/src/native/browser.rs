@@ -110,6 +110,8 @@ enum RendererState {
     /// The tab is alive but paused by a JavaScript dialog, so it cannot answer
     /// renderer-bound commands until the dialog is resolved.
     DialogBlocked,
+    /// The tab is alive but paused by the CDP Debugger domain.
+    DebuggerPaused,
 }
 
 /// Returns true for Chrome internal targets that should not be selected
@@ -667,7 +669,7 @@ impl BrowserManager {
                     // None. The RendererState is discarded; we only need it to
                     // not error (an unrevivable tab fails connect fast).
                     let target_id = self.pages[0].target_id.clone();
-                    self.ensure_renderer_alive(&session_ids[0], &target_id, None)
+                    self.ensure_renderer_alive(&session_ids[0], &target_id, None, None)
                         .await?;
                     0
                 }
@@ -770,6 +772,7 @@ impl BrowserManager {
         session_id: &str,
         target_id: &str,
         dialog_session: Option<&str>,
+        debugger_paused_sessions: Option<&HashSet<String>>,
     ) -> Result<RendererState, String> {
         if self
             .renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
@@ -781,6 +784,9 @@ impl BrowserManager {
         // paused, so the probe times out without the tab being discarded.
         if dialog_session == Some(session_id) {
             return Ok(RendererState::DialogBlocked);
+        }
+        if debugger_paused_sessions.is_some_and(|sessions| sessions.contains(session_id)) {
+            return Ok(RendererState::DebuggerPaused);
         }
         match tokio::time::timeout(
             Duration::from_millis(REVIVED_RENDERER_TIMEOUT_MS),
@@ -1357,6 +1363,7 @@ impl BrowserManager {
         &mut self,
         index: usize,
         dialog_session: Option<&str>,
+        debugger_paused_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         if index >= self.pages.len() {
             return Err(format!(
@@ -1371,7 +1378,12 @@ impl BrowserManager {
         // A discarded tab has no renderer to answer Page.enable, so revive it
         // first and commit the switch only once it is usable.
         let renderer_state = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(
+                &session_id,
+                &target_id,
+                dialog_session,
+                debugger_paused_sessions,
+            )
             .await
             .map_err(|e| {
                 format!(
@@ -1392,7 +1404,10 @@ impl BrowserManager {
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
         // hanging on get_url/get_title.
-        let (url, title) = if matches!(renderer_state, RendererState::DialogBlocked) {
+        let (url, title) = if matches!(
+            renderer_state,
+            RendererState::DialogBlocked | RendererState::DebuggerPaused
+        ) {
             (
                 self.pages[index].url.clone(),
                 self.pages[index].title.clone(),
@@ -1424,6 +1439,9 @@ impl BrowserManager {
         if matches!(renderer_state, RendererState::DialogBlocked) {
             result["dialogBlocked"] = json!(true);
         }
+        if matches!(renderer_state, RendererState::DebuggerPaused) {
+            result["debuggerPaused"] = json!(true);
+        }
         Ok(result)
     }
 
@@ -1431,6 +1449,7 @@ impl BrowserManager {
         &mut self,
         index: Option<usize>,
         dialog_session: Option<&str>,
+        debugger_paused_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let target_index = index.unwrap_or(self.active_page_index);
 
@@ -1470,7 +1489,12 @@ impl BrowserManager {
         let session_id = self.pages[self.active_page_index].session_id.clone();
         let target_id = self.pages[self.active_page_index].target_id.clone();
         if let Ok(state) = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(
+                &session_id,
+                &target_id,
+                dialog_session,
+                debugger_paused_sessions,
+            )
             .await
         {
             // Best-effort: enabling domains on the successor must not turn the
@@ -1739,19 +1763,22 @@ impl BrowserManager {
         &mut self,
         tab_id: u32,
         dialog_session: Option<&str>,
+        debugger_paused_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let index = self
             .pages
             .iter()
             .position(|p| p.tab_id == tab_id)
             .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
-        self.tab_switch(index, dialog_session).await
+        self.tab_switch(index, dialog_session, debugger_paused_sessions)
+            .await
     }
 
     pub async fn tab_close_by_id(
         &mut self,
         tab_id: Option<u32>,
         dialog_session: Option<&str>,
+        debugger_paused_sessions: Option<&HashSet<String>>,
     ) -> Result<Value, String> {
         let index = match tab_id {
             Some(id) => Some(
@@ -1762,7 +1789,8 @@ impl BrowserManager {
             ),
             None => None,
         };
-        self.tab_close(index, dialog_session).await
+        self.tab_close(index, dialog_session, debugger_paused_sessions)
+            .await
     }
 
     pub fn assign_tab_id(&mut self) -> u32 {
@@ -2719,7 +2747,7 @@ mod tests {
         assert_eq!(mgr.pages.len(), 2);
         assert_eq!(mgr.active_page_index, 0);
 
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None, None))
             .await
             .expect("tab_switch must not hang on a discarded tab")
             .expect("switching to a discarded tab should revive it");
@@ -2742,7 +2770,7 @@ mod tests {
         let url = start_mock_cdp_browser_with_discarded_tab(false).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
 
-        let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1, None))
+        let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1, None, None))
             .await
             .expect("tab_switch must not hang on a dead tab")
             .expect_err("switching to an unrevivable tab should fail");
@@ -2841,7 +2869,7 @@ mod tests {
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
         assert_eq!(mgr.pages.len(), 2);
 
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None, None))
             .await
             .expect("tab_switch must not hang")
             .expect("switching to a responsive tab should succeed");
@@ -2864,7 +2892,7 @@ mod tests {
         let url = start_mock_cdp_browser_with_discarded_tab(true).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
 
-        let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None, None))
             .await
             .expect("tab_switch must not hang")
             .expect("switching to a discarded tab should revive it");
@@ -2971,7 +2999,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            mgr.tab_switch(1, Some("S-T-BLOCKED")),
+            mgr.tab_switch(1, Some("S-T-BLOCKED"), None),
         )
         .await
         .expect("tab_switch must not hang on a dialog-blocked tab")
@@ -2994,6 +3022,29 @@ mod tests {
         assert_eq!(mgr.active_page_index, 1);
     }
 
+    /// A debugger-paused renderer has the same liveness shape as a dialog
+    /// block, but it must be surfaced separately so callers use debugger
+    /// recovery instead of attempting discarded-tab revival.
+    #[tokio::test]
+    async fn test_tab_switch_does_not_misclassify_debugger_paused_tab() {
+        let (url, activations) = start_mock_cdp_browser_with_dialog_blocked_tab().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        let paused = std::collections::HashSet::from(["S-T-BLOCKED".to_string()]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.tab_switch(1, None, Some(&paused)),
+        )
+        .await
+        .expect("tab_switch must not hang on a debugger-paused tab")
+        .expect("switching to a debugger-paused live tab should succeed");
+
+        assert!(result.get("revived").is_none());
+        assert_eq!(result["debuggerPaused"], json!(true));
+        assert_eq!(activations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(mgr.active_page_index, 1);
+    }
+
     /// Closing the active tab must not hang when the tab that becomes active is
     /// itself discarded: the successor is revived before domains are enabled,
     /// rather than enable_domains blocking on a dead renderer.
@@ -3005,10 +3056,11 @@ mod tests {
         assert_eq!(mgr.active_page_index, 0);
 
         // Close the live active tab; the discarded tab becomes the successor.
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_close(Some(0), None))
-            .await
-            .expect("tab_close must not hang on a discarded successor")
-            .expect("closing a tab with a discarded successor should succeed");
+        let result =
+            tokio::time::timeout(Duration::from_secs(20), mgr.tab_close(Some(0), None, None))
+                .await
+                .expect("tab_close must not hang on a discarded successor")
+                .expect("closing a tab with a discarded successor should succeed");
 
         assert_eq!(result["closed"], json!(true));
         assert_eq!(
@@ -3029,10 +3081,11 @@ mod tests {
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
         assert_eq!(mgr.pages.len(), 2);
 
-        let result = tokio::time::timeout(Duration::from_secs(25), mgr.tab_close(Some(0), None))
-            .await
-            .expect("tab_close must not hang")
-            .expect("a committed close must report success even if the successor is dead");
+        let result =
+            tokio::time::timeout(Duration::from_secs(25), mgr.tab_close(Some(0), None, None))
+                .await
+                .expect("tab_close must not hang")
+                .expect("a committed close must report success even if the successor is dead");
 
         assert_eq!(result["closed"], json!(true));
         assert!(
