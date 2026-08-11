@@ -76,6 +76,7 @@ Changes listed here are carried by the Divebell release branch until they are av
 - **Install-script-free package (`0.33.2-divebell.3`):** The Divebell package relies on its bundled native binaries and the cross-platform wrapper's executable-bit repair, so it no longer declares an unnecessary `postinstall` lifecycle script that package-manager allowlists can block.
 - **Node 20 runtime package (`0.33.2-divebell.4`):** The npm package supports Node.js 20.19 or newer for installation and the JavaScript wrapper, while fork development and release tooling continue to use Node.js 24 and pnpm 11.
 - **Restore State save stages (`0.33.2-divebell.5`):** Initial, periodic, and close-time saves are independently configurable on each command, including commands sent to an existing daemon. Cross-origin storage collection prefers a background CDP target and retains a compatibility fallback.
+- **Compiled JavaScript debugger (`0.33.2-divebell.6`):** A lock-independent Chrome debugger control plane can inspect and resume paused JavaScript from a second CLI or MCP client. It provides compiled-source discovery and search, one-based UTF-16 breakpoint locations, conditional breakpoints, non-pausing logpoints, lifecycle events, and explicit `debug.inspect`, `debug.control`, and `evaluate` policy gates without requiring source files or source maps.
 
 ## Publishing the Divebell package
 
@@ -83,7 +84,7 @@ The published npm package is `@divebell/agent-browser`. Its version tracks the
 upstream version and adds a Divebell prerelease suffix, for example
 `0.33.2-divebell.1`.
 
-1. Update the root package version and run `npm run version:sync`.
+1. Update the root package version and run `pnpm version:sync`.
 2. Run the Rust tests and package checks locally.
 3. Push the release branch.
 4. Tag the exact release commit as `divebell-v<package-version>` and push the
