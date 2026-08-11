@@ -259,7 +259,7 @@ agent-browser click @e3         # uses docs's refs
 
 ### Discarded tab revival
 
-Browsers discard background tabs to save memory, leaving a tab with no renderer to drive. Switching to a discarded tab reactivates it, which reloads the page and resets its unsaved state; the switch result adds `"revived": true` so the reload is visible rather than silent. A tab whose page is paused by a JavaScript dialog is alive rather than discarded: the switch leaves it untouched and adds `"dialogBlocked": true`. Resolve the dialog with `dialog accept` or `dialog dismiss` and the tab keeps its state. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
+Browsers discard background tabs to save memory, leaving a tab with no renderer to drive. Switching to a discarded tab reactivates it, which reloads the page and resets its unsaved state; the switch result adds `"revived": true` so the reload is visible rather than silent. A tab whose page is paused by a JavaScript dialog or debugger is alive rather than discarded: the switch leaves it untouched and adds `"dialogBlocked": true` or `"debuggerPaused": true`. Resolve the dialog or resume the debugger and the tab keeps its state. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
 
 ### Iframe support
 
@@ -325,9 +325,19 @@ agent-browser errors                  # View page errors
 agent-browser errors --clear          # Clear error log
 agent-browser highlight <sel>         # Highlight element
 agent-browser inspect                 # Open Chrome DevTools for the active page
+agent-browser debug enable            # Enable compiled JavaScript debugging
+agent-browser debug scripts           # List loaded compiled script instances
+agent-browser debug source search <text> [--filter <url>]
+agent-browser debug breakpoint set <script-id> <line> [options]
+agent-browser debug breakpoint list|remove <probe-id>
+agent-browser debug logpoint set <script-id> <line> --expression <js>...
+agent-browser debug logpoint list|remove <probe-id>
+agent-browser debug status|stack|resume [selectors]
+agent-browser debug eval <expression> [--frame <index>]
+agent-browser debug events [--since <sequence>] [--wait <ms>] [--clear]
 ```
 
-See [Debugging](/debugging) for console, error, dialog, trace, highlight, and DevTools workflows. See [Video Recording](/recording) for `record` workflows and [Profiler](/profiler) for performance profiles.
+See [Debugging](/debugging) for compiled JavaScript breakpoints and logpoints, lock-independent pause recovery, console, error, dialog, trace, highlight, and DevTools workflows. See [Video Recording](/recording) for `record` workflows and [Profiler](/profiler) for performance profiles.
 
 ## Memory diagnostics
 

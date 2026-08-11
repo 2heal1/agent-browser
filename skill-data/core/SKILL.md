@@ -384,6 +384,29 @@ agent-browser memory snapshot ./after.heapsnapshot
 
 Only one capture can be active per session. Sampling remains bound to the page where it started even if another tab becomes active. Use `memory status` to inspect the current capture and `memory cancel` to stop it safely. Keep `.heapprofile` and `.heapsnapshot` files local because they can contain page text, application data, credentials, and tokens. See [references/commands.md](references/commands.md#memory-diagnostics) for every option and output field.
 
+## Debugging compiled JavaScript
+
+Use the Chrome-only `debug` commands when a loaded bundle must be inspected without source files or source maps. Enable the debugger, search the compiled source, set a probe, then use a separate command to inspect or resume if execution pauses.
+
+```bash
+agent-browser debug enable
+agent-browser debug scripts --filter assets --json
+agent-browser debug source search "checkout" --filter assets --json
+agent-browser debug breakpoint set <script-id> <line> --strict --json
+agent-browser debug stack --json
+agent-browser debug eval "order.id" --frame 0 --json
+agent-browser debug resume
+```
+
+Debugger control bypasses the daemon's ordinary renderer-command lock, so it remains available when an earlier `eval`, click, or page action is stopped at a breakpoint. If more than one page is paused, select it with exactly one of `--tab`, `--session`, or `--pause-id`. Use logpoints when evidence is needed without pausing:
+
+```bash
+agent-browser debug logpoint set <script-id> <line> --when "order.ready" --expression "order" --json
+agent-browser debug events --since 0 --wait 5000 --json
+```
+
+Do not infer source identity from script parents. Use the returned script instance and lineage fields. Persistent rebinding is allowed only for a resolved runtime owner within the same connection, session, document generation, execution context, and compiled URL. See [references/debugging-compiled-js.md](references/debugging-compiled-js.md) for commands, lifecycle rules, safe log serialization, and HMR or Module Federation extension guidance.
+
 ## Diagnosing install issues
 
 If a command fails unexpectedly (`Unknown command`, `Failed to connect`, stale daemons, version mismatches after `upgrade`, missing Chrome, etc.) run `doctor` before anything else:
@@ -518,6 +541,7 @@ That pulls in:
 - `references/trust-boundaries.md` — safety rules for driving a real browser
 - `references/session-management.md` — persistence, multi-session workflows
 - `references/profiling.md` — Chrome DevTools tracing and profiling
+- `references/debugging-compiled-js.md` — compiled JavaScript breakpoints, logpoints, pause recovery, and lifecycle semantics
 - `references/video-recording.md` — video capture options
 - `references/streaming.md` covers live viewport streaming, remote input, per-client frame rate, and the encoding vars that set bandwidth cost
 - `references/proxy-support.md` — proxy configuration

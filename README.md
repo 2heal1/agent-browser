@@ -1,6 +1,6 @@
 # agent-browser
 
-Browser automation CLI for AI agents. This Divebell build adds memory diagnostics and code coverage support.
+Browser automation CLI for AI agents. This Divebell build adds compiled JavaScript debugging, safe logpoints, memory diagnostics, and code coverage support.
 
 [![skills.sh](https://skills.sh/b/vercel-labs/agent-browser)](https://skills.sh/vercel-labs/agent-browser)
 
@@ -345,7 +345,7 @@ agent-browser click @e3              # click uses docs's refs
 agent-browser tab close docs         # close by label
 ```
 
-Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the discarded page and resets its unsaved state, and the switch result reports `"revived": true`. A tab whose page is paused by a JavaScript dialog is alive rather than discarded, so the switch leaves it untouched and reports `"dialogBlocked": true`; resolve the dialog with `dialog accept` or `dialog dismiss` before interacting. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
+Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the discarded page and resets its unsaved state, and the switch result reports `"revived": true`. A tab whose page is paused by a JavaScript dialog or debugger is alive rather than discarded, so the switch leaves it untouched and reports `"dialogBlocked": true` or `"debuggerPaused": true`. Resolve the dialog or resume the debugger before interacting. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
 
 ### Frames
 
@@ -394,6 +394,14 @@ agent-browser memory sampling stop     # Save allocation profile and top call si
 agent-browser memory snapshot          # Stream a heap snapshot to a local file
 agent-browser memory status            # Show the active capture
 agent-browser memory cancel            # Cancel the active capture
+agent-browser debug enable              # Enable compiled JavaScript debugging
+agent-browser debug scripts             # List loaded script instances
+agent-browser debug source search <text> # Search compiled sources
+agent-browser debug breakpoint set <script-id> <line> # Set a breakpoint
+agent-browser debug logpoint set <script-id> <line> --expression <js> # Add a logpoint
+agent-browser debug stack               # Inspect the current pause
+agent-browser debug resume              # Resume the current pause
+agent-browser debug events              # Read debugger and logpoint events
 agent-browser console                 # View console messages (log, error, warn, info)
 agent-browser console --json          # JSON output with raw CDP args for programmatic access
 agent-browser console --clear         # Clear console
@@ -410,6 +418,75 @@ agent-browser state clear [name]      # Clear states for session
 agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
+
+### Compiled JavaScript debugger
+
+The Chrome debugger works with the JavaScript that the browser actually loaded. It does not require project source files or source maps. This makes it suitable for production bundles, Rstack output, and Module Federation containers where only compiled assets are available.
+
+Start by enabling debugging, then locate a script and a compiled line:
+
+```bash
+agent-browser open https://app.example.com
+agent-browser debug enable
+agent-browser debug scripts --filter assets --json
+agent-browser debug source search "checkout" --filter assets --json
+```
+
+`debug scripts` returns a `scriptInstanceKey` scoped by connection generation, CDP session, document generation, and script ID. It also returns a separate `sourceLineageKey` and `runtimeOwner` evidence. Parent or initiator information is evidence only and is never used as identity. The generic substrate reports runtime ownership as `unknown` until a caller supplies reliable Host or Module Federation evidence. Persistent probes do not automatically rebind when ownership is unknown or ambiguous.
+
+Set a breakpoint using the returned script ID and one-based compiled line:
+
+```bash
+agent-browser debug breakpoint set 42 108 --strict --json
+agent-browser eval "startCheckout()"
+```
+
+When the page pauses, use another shell, agent tool call, or MCP call:
+
+```bash
+agent-browser debug status --json
+agent-browser debug stack --json
+agent-browser debug eval "order.id" --frame 0 --json
+agent-browser debug step-over
+agent-browser debug resume
+```
+
+Debugger inspection and control use a lock-independent daemon path. If the first CLI is waiting inside `eval`, `click`, or another renderer command that hit a breakpoint, a second CLI can still read the pause and resume it. When multiple tabs are paused, pass `--tab <tN>`, `--session <cdp-session-id>`, or `--pause-id <id>` to `stack`, `eval`, `resume`, and step commands.
+
+Locations use one-based lines and one-based UTF-16 columns. With only a line, `--strict` selects a breakable point on that line; an explicit `--column` must match exactly. The default `--after` mode resolves forward, while `--before` and `--nearest` use backward candidates only after Chrome proves that they reach an anchor in the requested function. `--nearest` prefers a forward point when distances tie. Resolution is bounded to three lines and 512 UTF-16 code units by default; tighten or explicitly expand those bounds with `--max-lines <n>` and `--max-utf16-distance <n>`. `--nearest-forward` remains a compatibility alias for `--after`. Breakpoint conditions and logpoint expressions are syntax checked with `Runtime.compileScript`. A valid expression can still fail when the selected runtime scope does not contain a referenced variable; the logpoint records that failure without creating an unrelated pause.
+
+Logpoints use a private Runtime binding rather than the page console:
+
+```bash
+agent-browser debug logpoint set 42 108 \
+  --when "order.ready" \
+  --expression "order" \
+  --expression "cart.total" \
+  --tag phase=checkout \
+  --json
+
+agent-browser debug events --since 0 --wait 5000 --json
+```
+
+Logpoints use a random per-connection Runtime binding name and nonce. Serialization is bounded by depth, property count, array length, string length, and a 64 KiB payload cap. It handles cycles, `BigInt`, non-finite numbers, functions, symbols, accessors, throwing getters, and proxies without pausing the page. A false `--when` condition emits nothing; a thrown condition is reported as `whenError`, while individual expression failures are reported as `evaluationError`. Incoming binding messages must match the active connection nonce, CDP session, execution context, logical probe, and physical binding. Script identity, location, tags, and owner metadata always come from the daemon registry rather than the page payload.
+
+Manage probes and lifecycle explicitly:
+
+```bash
+agent-browser debug breakpoint list --json
+agent-browser debug breakpoint remove <probe-id>
+agent-browser debug logpoint list --json
+agent-browser debug logpoint remove <probe-id>
+agent-browser debug disable --resume
+```
+
+Use `--persist` to request same-document rebinding after a new compiled script instance appears. Automatic rebinding requires a resolved runtime owner and an exact lineage match for session, document generation, execution context, compiled URL, and owner ID. Navigation, target detach, browser reconnect, and connection reset invalidate stale physical bindings. Rebinding never crosses a connection or document generation.
+
+`debug events` stores up to 10,000 events and 8 MiB per daemon session. Responses include `oldestSequence`, `latestSequence`, `gap`, `bufferGap`, `transportGap`, `droppedThroughSequence`, and `lastTransportGapSequence`. A `transport-gap` event reports CDP broadcast lag. Use `--since` as a cursor, `--wait` for bounded long polling, and `--clear` after consuming evidence.
+
+Debugger inspection uses the `debug.inspect` action-policy category, while probe changes and execution control use `debug.control`. Frame evaluation, logpoints, and conditional breakpoints also require `evaluate` because they run expressions in page context. When multiple policy categories apply, denial takes precedence over confirmation.
+
+The debugger is supported on Chrome and Chromium only. Reading one compiled source response is capped at 32 MiB; source search returns at most 100 matches by default with bounded context and accepts up to 1,000. The debugger is intentionally a generic CDP substrate. Rstack HMR cycle grouping and Module Federation shared-module consumer or runtime-instance attribution belong in the Divebell extension, which should consume script, probe, pause, and lifecycle events without changing core script identity.
 
 ### Memory diagnostics
 
@@ -560,7 +637,7 @@ Profiles:
 - `core` — Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
 - `network` — Network routes, request inspection, HAR, headers, credentials, offline
 - `state` — Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` — Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `debug` — Compiled JavaScript breakpoints, logpoints, pause recovery, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
 - `react` — React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard

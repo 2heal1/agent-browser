@@ -16,6 +16,7 @@ use super::actions::{
     maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
+use super::debugger::DebuggerController;
 use super::memory::{self, CaptureKind, MemoryState};
 use super::state;
 use super::stream::{IdleActivity, StreamServer};
@@ -230,6 +231,7 @@ async fn run_socket_server(
     let daemon_state =
         DaemonState::new_with_stream(stream_client, stream_server, idle_activity.clone());
     let memory_state = daemon_state.memory_state.clone();
+    let debugger = daemon_state.debugger.clone();
     let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(daemon_state));
 
@@ -254,11 +256,13 @@ async fn run_socket_server(
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
                         let memory_state = memory_state.clone();
+                        let debugger = debugger.clone();
                         tokio::spawn(async move {
                             handle_connection(
                                 stream,
                                 state,
                                 memory_state,
+                                debugger,
                                 idle_activity,
                                 sf,
                                 cn,
@@ -393,6 +397,7 @@ async fn run_socket_server(
     let daemon_state =
         DaemonState::new_with_stream(stream_client, stream_server, idle_activity.clone());
     let memory_state = daemon_state.memory_state.clone();
+    let debugger = daemon_state.debugger.clone();
     let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(daemon_state));
 
@@ -417,11 +422,13 @@ async fn run_socket_server(
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
                         let memory_state = memory_state.clone();
+                        let debugger = debugger.clone();
                         tokio::spawn(async move {
                             handle_connection(
                                 stream,
                                 state,
                                 memory_state,
+                                debugger,
                                 idle_activity,
                                 sf,
                                 cn,
@@ -507,10 +514,11 @@ async fn run_socket_server(
     Ok(())
 }
 
-async fn handle_connection<S>(
+pub(crate) async fn handle_connection<S>(
     stream: S,
     state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
     memory_state: MemoryState,
+    debugger: Arc<DebuggerController>,
     idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
@@ -581,6 +589,11 @@ async fn handle_connection<S>(
                             "error": error,
                         }),
                     }
+                } else if DebuggerController::is_fast_action(&action)
+                    || (matches!(action.as_str(), "confirm" | "deny")
+                        && debugger.has_pending_confirmation(&cmd))
+                {
+                    debugger.execute_fast(&cmd).await
                 } else {
                     let mut s = state.lock().await;
                     let response = execute_command(&cmd, &mut s).await;
@@ -713,6 +726,7 @@ mod tests {
     async fn memory_status_and_snapshot_cancel_do_not_wait_for_daemon_state_lock() {
         let daemon_state = DaemonState::new();
         let memory_state = daemon_state.memory_state.clone();
+        let debugger = daemon_state.debugger.clone();
         memory_state.begin_test_capture(CaptureKind::Snapshot);
         let state = Arc::new(tokio::sync::Mutex::new(daemon_state));
         let state_guard = state.lock().await;
@@ -722,6 +736,7 @@ mod tests {
             server,
             state.clone(),
             memory_state.clone(),
+            debugger,
             Arc::new(IdleActivity::new()),
             None,
             notify,
@@ -755,6 +770,19 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["data"]["cancelled"], true);
         assert_eq!(memory_state.status()["cancelRequested"], true);
+
+        writer
+            .write_all(b"{\"id\":\"debug\",\"action\":\"debug_status\"}\n")
+            .await
+            .unwrap();
+        line.clear();
+        tokio::time::timeout(Duration::from_millis(250), reader.read_line(&mut line))
+            .await
+            .expect("debugger status should bypass the daemon state lock")
+            .unwrap();
+        let response: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["paused"], false);
 
         drop(state_guard);
         connection.abort();

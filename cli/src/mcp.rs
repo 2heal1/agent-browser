@@ -113,6 +113,26 @@ const TOOL_MEMORY_SAMPLING_STOP: &str = "agent_browser_memory_sampling_stop";
 const TOOL_MEMORY_SNAPSHOT: &str = "agent_browser_memory_snapshot";
 const TOOL_MEMORY_COLLECT_GARBAGE: &str = "agent_browser_memory_collect_garbage";
 const TOOL_MEMORY_CANCEL: &str = "agent_browser_memory_cancel";
+const TOOL_DEBUG_ENABLE: &str = "agent_browser_debug_enable";
+const TOOL_DEBUG_DISABLE: &str = "agent_browser_debug_disable";
+const TOOL_DEBUG_STATUS: &str = "agent_browser_debug_status";
+const TOOL_DEBUG_SCRIPTS: &str = "agent_browser_debug_scripts";
+const TOOL_DEBUG_SOURCE: &str = "agent_browser_debug_source";
+const TOOL_DEBUG_SOURCE_SEARCH: &str = "agent_browser_debug_source_search";
+const TOOL_DEBUG_BREAKPOINT_SET: &str = "agent_browser_debug_breakpoint_set";
+const TOOL_DEBUG_BREAKPOINT_LIST: &str = "agent_browser_debug_breakpoint_list";
+const TOOL_DEBUG_BREAKPOINT_REMOVE: &str = "agent_browser_debug_breakpoint_remove";
+const TOOL_DEBUG_LOGPOINT_SET: &str = "agent_browser_debug_logpoint_set";
+const TOOL_DEBUG_LOGPOINT_LIST: &str = "agent_browser_debug_logpoint_list";
+const TOOL_DEBUG_LOGPOINT_REMOVE: &str = "agent_browser_debug_logpoint_remove";
+const TOOL_DEBUG_PAUSE: &str = "agent_browser_debug_pause";
+const TOOL_DEBUG_RESUME: &str = "agent_browser_debug_resume";
+const TOOL_DEBUG_STEP_OVER: &str = "agent_browser_debug_step_over";
+const TOOL_DEBUG_STEP_INTO: &str = "agent_browser_debug_step_into";
+const TOOL_DEBUG_STEP_OUT: &str = "agent_browser_debug_step_out";
+const TOOL_DEBUG_STACK: &str = "agent_browser_debug_stack";
+const TOOL_DEBUG_EVAL: &str = "agent_browser_debug_eval";
+const TOOL_DEBUG_EVENTS: &str = "agent_browser_debug_events";
 const TOOL_RECORD_START: &str = "agent_browser_record_start";
 const TOOL_RECORD_STOP: &str = "agent_browser_record_stop";
 const TOOL_RECORD_RESTART: &str = "agent_browser_record_restart";
@@ -263,7 +283,7 @@ impl ToolProfile {
             Self::Core => "Everyday browser automation with navigation, snapshots, common interaction, waits, screenshots, basic reads, tab basics, JavaScript eval, close, and profile discovery.",
             Self::Network => "Network interception, request inspection, HAR capture, headers, credentials, and offline mode.",
             Self::State => "Cookies, storage, auth profiles, saved browser state, sessions, Chrome profiles, and bundled skills.",
-            Self::Debug => "Console/errors, highlighting, DevTools, tracing, profiling, memory diagnostics, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
+            Self::Debug => "Compiled JavaScript breakpoints, logpoints and pause recovery, plus console/errors, highlighting, DevTools, tracing, profiling, memory diagnostics, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
             Self::Tabs => "Tab, window, frame, and JavaScript dialog management.",
             Self::React => "React tree inspection, render recording, Suspense inspection, Web Vitals, SPA pushstate, and init-script removal.",
             Self::Mobile => "Viewport/device/geolocation/media emulation plus touch, swipe, and lower-level mouse tools.",
@@ -422,6 +442,26 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_MEMORY_SNAPSHOT,
     TOOL_MEMORY_COLLECT_GARBAGE,
     TOOL_MEMORY_CANCEL,
+    TOOL_DEBUG_ENABLE,
+    TOOL_DEBUG_DISABLE,
+    TOOL_DEBUG_STATUS,
+    TOOL_DEBUG_SCRIPTS,
+    TOOL_DEBUG_SOURCE,
+    TOOL_DEBUG_SOURCE_SEARCH,
+    TOOL_DEBUG_BREAKPOINT_SET,
+    TOOL_DEBUG_BREAKPOINT_LIST,
+    TOOL_DEBUG_BREAKPOINT_REMOVE,
+    TOOL_DEBUG_LOGPOINT_SET,
+    TOOL_DEBUG_LOGPOINT_LIST,
+    TOOL_DEBUG_LOGPOINT_REMOVE,
+    TOOL_DEBUG_PAUSE,
+    TOOL_DEBUG_RESUME,
+    TOOL_DEBUG_STEP_OVER,
+    TOOL_DEBUG_STEP_INTO,
+    TOOL_DEBUG_STEP_OUT,
+    TOOL_DEBUG_STACK,
+    TOOL_DEBUG_EVAL,
+    TOOL_DEBUG_EVENTS,
     TOOL_RECORD_START,
     TOOL_RECORD_STOP,
     TOOL_RECORD_RESTART,
@@ -1382,6 +1422,146 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            TOOL_DEBUG_ENABLE,
+            "Debugger enable",
+            "Enable compiled JavaScript debugging for one page or all tabs.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "allTabs": { "type": "boolean" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_DISABLE,
+            "Debugger disable",
+            "Disable compiled JavaScript debugging. Paused sessions require resume=true.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "allTabs": { "type": "boolean" }, "resume": { "type": "boolean" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_STATUS,
+            "Debugger status",
+            "List debugger sessions and current pauses.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" }, "allTabs": { "type": "boolean" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_SCRIPTS,
+            "Debugger scripts",
+            "List compiled JavaScript script instances without source maps.",
+            json!({ "filter": { "type": "string", "description": "Substring matched against compiled script URLs." }, "tab": { "type": "string" }, "cdpSession": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_SOURCE,
+            "Debugger script source",
+            "Read the compiled source for a CDP script ID.",
+            json!({ "scriptId": { "type": "string" }, "tab": { "type": "string" }, "cdpSession": { "type": "string" } }),
+            &["scriptId"],
+        ),
+        tool(
+            TOOL_DEBUG_SOURCE_SEARCH,
+            "Debugger source search",
+            "Search compiled script text and return one-based UTF-16 locations.",
+            json!({ "query": { "type": "string" }, "filter": { "type": "string" }, "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "maxResults": { "type": "integer", "minimum": 1, "maximum": 1000 } }),
+            &["query"],
+        ),
+        tool(
+            TOOL_DEBUG_BREAKPOINT_SET,
+            "Debugger breakpoint set",
+            "Set a breakpoint in compiled JavaScript after validating a bounded breakable location.",
+            json!({ "scriptId": { "type": "string" }, "line": { "type": "integer", "minimum": 1 }, "column": { "type": "integer", "minimum": 1 }, "condition": { "type": "string" }, "mode": { "type": "string", "enum": ["strict", "before", "after", "nearest", "nearest-forward"] }, "maxLines": { "type": "integer", "minimum": 1, "maximum": 500 }, "maxUtf16Distance": { "type": "integer", "minimum": 1, "maximum": 1000000 }, "persist": { "type": "boolean" }, "tags": { "type": "object", "additionalProperties": { "type": "string" } }, "tab": { "type": "string" }, "cdpSession": { "type": "string" } }),
+            &["scriptId", "line"],
+        ),
+        tool(
+            TOOL_DEBUG_BREAKPOINT_LIST,
+            "Debugger breakpoint list",
+            "List logical breakpoints and their physical script bindings.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_BREAKPOINT_REMOVE,
+            "Debugger breakpoint remove",
+            "Remove a logical breakpoint and all physical bindings.",
+            json!({ "probeId": { "type": "string" } }),
+            &["probeId"],
+        ),
+        tool(
+            TOOL_DEBUG_LOGPOINT_SET,
+            "Debugger logpoint set",
+            "Set a non-pausing compiled JavaScript logpoint with bounded safe serialization.",
+            json!({ "scriptId": { "type": "string" }, "line": { "type": "integer", "minimum": 1 }, "column": { "type": "integer", "minimum": 1 }, "expressions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 16 }, "when": { "type": "string" }, "mode": { "type": "string", "enum": ["strict", "before", "after", "nearest", "nearest-forward"] }, "maxLines": { "type": "integer", "minimum": 1, "maximum": 500 }, "maxUtf16Distance": { "type": "integer", "minimum": 1, "maximum": 1000000 }, "persist": { "type": "boolean" }, "tags": { "type": "object", "additionalProperties": { "type": "string" } }, "tab": { "type": "string" }, "cdpSession": { "type": "string" } }),
+            &["scriptId", "line", "expressions"],
+        ),
+        tool(
+            TOOL_DEBUG_LOGPOINT_LIST,
+            "Debugger logpoint list",
+            "List logical logpoints and their physical script bindings.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_LOGPOINT_REMOVE,
+            "Debugger logpoint remove",
+            "Remove a logical logpoint, its breakpoints, and unused runtime binding.",
+            json!({ "probeId": { "type": "string" } }),
+            &["probeId"],
+        ),
+        tool(
+            TOOL_DEBUG_PAUSE,
+            "Debugger pause",
+            "Request a JavaScript pause in a selected page session.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_RESUME,
+            "Debugger resume",
+            "Resume a paused page. A selector is required when multiple pages are paused.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_STEP_OVER,
+            "Debugger step over",
+            "Step over in a paused JavaScript page.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_STEP_INTO,
+            "Debugger step into",
+            "Step into in a paused JavaScript page.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_STEP_OUT,
+            "Debugger step out",
+            "Step out in a paused JavaScript page.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_STACK,
+            "Debugger stack",
+            "Read call frames from a selected JavaScript pause.",
+            json!({ "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_DEBUG_EVAL,
+            "Debugger frame evaluate",
+            "Evaluate an expression on a paused call frame.",
+            json!({ "expression": { "type": "string" }, "frame": { "type": "integer", "minimum": 0 }, "callFrameId": { "type": "string" }, "tab": { "type": "string" }, "cdpSession": { "type": "string" }, "pauseId": { "type": "string" } }),
+            &["expression"],
+        ),
+        tool(
+            TOOL_DEBUG_EVENTS,
+            "Debugger events",
+            "Read or long-poll the persistent debugger event ring.",
+            json!({ "since": { "type": "integer", "minimum": 0 }, "waitMs": { "type": "integer", "minimum": 0 }, "clear": { "type": "boolean" } }),
+            &[],
+        ),
+        tool(
             TOOL_RECORD_START,
             "Record start",
             "Start video recording.",
@@ -2088,6 +2268,14 @@ fn is_read_only_tool(name: &str) -> bool {
             | TOOL_DIALOG_STATUS
             | TOOL_MEMORY_METRICS
             | TOOL_MEMORY_STATUS
+            | TOOL_DEBUG_STATUS
+            | TOOL_DEBUG_SCRIPTS
+            | TOOL_DEBUG_SOURCE
+            | TOOL_DEBUG_SOURCE_SEARCH
+            | TOOL_DEBUG_BREAKPOINT_LIST
+            | TOOL_DEBUG_LOGPOINT_LIST
+            | TOOL_DEBUG_STACK
+            | TOOL_DEBUG_EVENTS
             | TOOL_CLIPBOARD_READ
             | TOOL_AUTH_LIST
             | TOOL_AUTH_SHOW
@@ -2298,6 +2486,26 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_MEMORY_SNAPSHOT => call_memory_snapshot(arguments),
         TOOL_MEMORY_COLLECT_GARBAGE => call_literal(arguments, &["memory", "collect-garbage"]),
         TOOL_MEMORY_CANCEL => call_literal(arguments, &["memory", "cancel"]),
+        TOOL_DEBUG_ENABLE => call_debug_session_command(arguments, "enable", true, false),
+        TOOL_DEBUG_DISABLE => call_debug_disable(arguments),
+        TOOL_DEBUG_STATUS => call_debug_session_command(arguments, "status", true, true),
+        TOOL_DEBUG_SCRIPTS => call_debug_scripts(arguments),
+        TOOL_DEBUG_SOURCE => call_debug_source(arguments),
+        TOOL_DEBUG_SOURCE_SEARCH => call_debug_source_search(arguments),
+        TOOL_DEBUG_BREAKPOINT_SET => call_debug_probe_set(arguments, "breakpoint"),
+        TOOL_DEBUG_BREAKPOINT_LIST => call_literal(arguments, &["debug", "breakpoint", "list"]),
+        TOOL_DEBUG_BREAKPOINT_REMOVE => call_debug_probe_remove(arguments, "breakpoint"),
+        TOOL_DEBUG_LOGPOINT_SET => call_debug_probe_set(arguments, "logpoint"),
+        TOOL_DEBUG_LOGPOINT_LIST => call_literal(arguments, &["debug", "logpoint", "list"]),
+        TOOL_DEBUG_LOGPOINT_REMOVE => call_debug_probe_remove(arguments, "logpoint"),
+        TOOL_DEBUG_PAUSE => call_debug_session_command(arguments, "pause", false, false),
+        TOOL_DEBUG_RESUME => call_debug_session_command(arguments, "resume", false, true),
+        TOOL_DEBUG_STEP_OVER => call_debug_session_command(arguments, "step-over", false, true),
+        TOOL_DEBUG_STEP_INTO => call_debug_session_command(arguments, "step-into", false, true),
+        TOOL_DEBUG_STEP_OUT => call_debug_session_command(arguments, "step-out", false, true),
+        TOOL_DEBUG_STACK => call_debug_session_command(arguments, "stack", false, true),
+        TOOL_DEBUG_EVAL => call_debug_eval(arguments),
+        TOOL_DEBUG_EVENTS => call_debug_events(arguments),
         TOOL_RECORD_START => call_record_start(arguments, "start"),
         TOOL_RECORD_STOP => call_literal(arguments, &["record", "stop"]),
         TOOL_RECORD_RESTART => call_record_start(arguments, "restart"),
@@ -3074,6 +3282,199 @@ fn call_memory_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
     if let Some(max_size) = optional_u64(arguments, "maxSize")? {
         args.push("--max-size".to_string());
         args.push(max_size.to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn append_debug_selectors(
+    arguments: &Value,
+    args: &mut Vec<String>,
+    include_pause: bool,
+) -> Result<(), ProtocolError> {
+    if let Some(tab) = optional_string(arguments, "tab")? {
+        args.push("--tab".to_string());
+        args.push(tab);
+    }
+    if let Some(session) = optional_string(arguments, "cdpSession")? {
+        args.push("--session".to_string());
+        args.push(session);
+    }
+    if include_pause {
+        if let Some(pause_id) = optional_string(arguments, "pauseId")? {
+            args.push("--pause-id".to_string());
+            args.push(pause_id);
+        }
+    }
+    Ok(())
+}
+
+fn call_debug_session_command(
+    arguments: &Value,
+    subcommand: &str,
+    allow_all_tabs: bool,
+    include_pause: bool,
+) -> Result<Value, ProtocolError> {
+    let mut args = vec!["debug".to_string(), subcommand.to_string()];
+    append_debug_selectors(arguments, &mut args, include_pause)?;
+    if allow_all_tabs && optional_bool(arguments, "allTabs")?.unwrap_or(false) {
+        args.push("--all-tabs".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_disable(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["debug".to_string(), "disable".to_string()];
+    append_debug_selectors(arguments, &mut args, false)?;
+    if optional_bool(arguments, "allTabs")?.unwrap_or(false) {
+        args.push("--all-tabs".to_string());
+    }
+    if optional_bool(arguments, "resume")?.unwrap_or(false) {
+        args.push("--resume".to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_scripts(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["debug".to_string(), "scripts".to_string()];
+    append_debug_selectors(arguments, &mut args, false)?;
+    if let Some(filter) = optional_string(arguments, "filter")? {
+        args.push("--filter".to_string());
+        args.push(filter);
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_source(arguments: &Value) -> Result<Value, ProtocolError> {
+    let script_id = required_string(arguments, "scriptId")?;
+    let mut args = vec!["debug".to_string(), "source".to_string(), script_id];
+    append_debug_selectors(arguments, &mut args, false)?;
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_source_search(arguments: &Value) -> Result<Value, ProtocolError> {
+    let query = required_string(arguments, "query")?;
+    let mut args = vec![
+        "debug".to_string(),
+        "source".to_string(),
+        "search".to_string(),
+        query,
+    ];
+    append_debug_selectors(arguments, &mut args, false)?;
+    if let Some(filter) = optional_string(arguments, "filter")? {
+        args.push("--filter".to_string());
+        args.push(filter);
+    }
+    if let Some(max_results) = optional_u64(arguments, "maxResults")? {
+        args.push("--max-results".to_string());
+        args.push(max_results.to_string());
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_probe_set(arguments: &Value, kind: &str) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, debug_probe_args(arguments, kind)?, None)
+}
+
+fn debug_probe_args(arguments: &Value, kind: &str) -> Result<Vec<String>, ProtocolError> {
+    let script_id = required_string(arguments, "scriptId")?;
+    let line = required_u64(arguments, "line")?;
+    let mut args = vec![
+        "debug".to_string(),
+        kind.to_string(),
+        "set".to_string(),
+        script_id,
+        line.to_string(),
+    ];
+    append_debug_selectors(arguments, &mut args, false)?;
+    if let Some(column) = optional_u64(arguments, "column")? {
+        args.push("--column".to_string());
+        args.push(column.to_string());
+    }
+    if let Some(max_lines) = optional_u64(arguments, "maxLines")? {
+        args.push("--max-lines".to_string());
+        args.push(max_lines.to_string());
+    }
+    if let Some(max_distance) = optional_u64(arguments, "maxUtf16Distance")? {
+        args.push("--max-utf16-distance".to_string());
+        args.push(max_distance.to_string());
+    }
+    if let Some(mode) = optional_string(arguments, "mode")? {
+        args.push(format!("--{}", mode));
+    }
+    if optional_bool(arguments, "persist")?.unwrap_or(false) {
+        args.push("--persist".to_string());
+    }
+    if kind == "breakpoint" {
+        if let Some(condition) = optional_string(arguments, "condition")? {
+            args.push("--condition".to_string());
+            args.push(condition);
+        }
+    } else {
+        if let Some(when) = optional_string(arguments, "when")? {
+            args.push("--when".to_string());
+            args.push(when);
+        }
+        for expression in required_string_array(arguments, "expressions")? {
+            args.push("--expression".to_string());
+            args.push(expression);
+        }
+    }
+    if let Some(tags) = optional_value(arguments, "tags")? {
+        let object = tags
+            .as_object()
+            .ok_or_else(|| ProtocolError::invalid_params("tags must be an object"))?;
+        for (key, value) in object {
+            let value = value
+                .as_str()
+                .ok_or_else(|| ProtocolError::invalid_params("tag values must be strings"))?;
+            args.push("--tag".to_string());
+            args.push(format!("{}={}", key, value));
+        }
+    }
+    Ok(args)
+}
+
+fn call_debug_probe_remove(arguments: &Value, kind: &str) -> Result<Value, ProtocolError> {
+    let probe_id = required_string(arguments, "probeId")?;
+    call_cli_tool(
+        arguments,
+        vec![
+            "debug".to_string(),
+            kind.to_string(),
+            "remove".to_string(),
+            probe_id,
+        ],
+        None,
+    )
+}
+
+fn call_debug_eval(arguments: &Value) -> Result<Value, ProtocolError> {
+    let expression = required_string(arguments, "expression")?;
+    let mut args = vec!["debug".to_string(), "eval".to_string(), expression];
+    append_debug_selectors(arguments, &mut args, true)?;
+    if let Some(frame) = optional_u64(arguments, "frame")? {
+        args.push("--frame".to_string());
+        args.push(frame.to_string());
+    }
+    if let Some(call_frame_id) = optional_string(arguments, "callFrameId")? {
+        args.push("--call-frame-id".to_string());
+        args.push(call_frame_id);
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_debug_events(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["debug".to_string(), "events".to_string()];
+    if let Some(since) = optional_u64(arguments, "since")? {
+        args.push("--since".to_string());
+        args.push(since.to_string());
+    }
+    if let Some(wait_ms) = optional_u64(arguments, "waitMs")? {
+        args.push("--wait".to_string());
+        args.push(wait_ms.to_string());
+    }
+    if optional_bool(arguments, "clear")?.unwrap_or(false) {
+        args.push("--clear".to_string());
     }
     call_cli_tool(arguments, args, None)
 }
@@ -4205,7 +4606,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_profile_contains_memory_tools() {
+    fn debug_profile_contains_memory_and_compiled_javascript_tools() {
         let config = McpConfig::from_profiles(vec![ToolProfile::Debug]);
         assert!(config.allows(TOOL_MEMORY_METRICS));
         assert!(config.allows(TOOL_MEMORY_STATUS));
@@ -4214,6 +4615,82 @@ mod tests {
         assert!(config.allows(TOOL_MEMORY_SNAPSHOT));
         assert!(config.allows(TOOL_MEMORY_COLLECT_GARBAGE));
         assert!(config.allows(TOOL_MEMORY_CANCEL));
+        for tool in [
+            TOOL_DEBUG_ENABLE,
+            TOOL_DEBUG_DISABLE,
+            TOOL_DEBUG_STATUS,
+            TOOL_DEBUG_SCRIPTS,
+            TOOL_DEBUG_SOURCE,
+            TOOL_DEBUG_SOURCE_SEARCH,
+            TOOL_DEBUG_BREAKPOINT_SET,
+            TOOL_DEBUG_BREAKPOINT_LIST,
+            TOOL_DEBUG_BREAKPOINT_REMOVE,
+            TOOL_DEBUG_LOGPOINT_SET,
+            TOOL_DEBUG_LOGPOINT_LIST,
+            TOOL_DEBUG_LOGPOINT_REMOVE,
+            TOOL_DEBUG_PAUSE,
+            TOOL_DEBUG_RESUME,
+            TOOL_DEBUG_STEP_OVER,
+            TOOL_DEBUG_STEP_INTO,
+            TOOL_DEBUG_STEP_OUT,
+            TOOL_DEBUG_STACK,
+            TOOL_DEBUG_EVAL,
+            TOOL_DEBUG_EVENTS,
+        ] {
+            assert!(config.allows(tool), "missing debug profile tool {tool}");
+        }
+        assert!(is_read_only_tool(TOOL_DEBUG_SOURCE));
+        assert!(is_read_only_tool(TOOL_DEBUG_EVENTS));
+        assert!(!is_read_only_tool(TOOL_DEBUG_EVAL));
+    }
+
+    #[test]
+    fn debug_logpoint_mcp_arguments_map_to_canonical_cli_flags() {
+        let args = debug_probe_args(
+            &json!({
+                "scriptId": "42",
+                "line": 108,
+                "column": 3,
+                "mode": "nearest",
+                "maxLines": 3,
+                "maxUtf16Distance": 256,
+                "when": "order.ready",
+                "expressions": ["order", "cart.total"],
+                "persist": true,
+                "tags": { "phase": "checkout" },
+                "tab": "t2"
+            }),
+            "logpoint",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "debug",
+                "logpoint",
+                "set",
+                "42",
+                "108",
+                "--tab",
+                "t2",
+                "--column",
+                "3",
+                "--max-lines",
+                "3",
+                "--max-utf16-distance",
+                "256",
+                "--nearest",
+                "--persist",
+                "--when",
+                "order.ready",
+                "--expression",
+                "order",
+                "--expression",
+                "cart.total",
+                "--tag",
+                "phase=checkout",
+            ]
+        );
     }
 
     #[test]

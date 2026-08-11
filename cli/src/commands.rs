@@ -149,6 +149,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "profiler"
             | "memory"
             | "coverage"
+            | "debug"
             | "record"
             | "console"
             | "errors"
@@ -1661,6 +1662,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === JavaScript code coverage (Chrome only) ===
         "coverage" => parse_coverage(&rest, &id),
 
+        // === Compiled JavaScript debugging (Chrome only) ===
+        "debug" => parse_debug(&rest, &id),
+
         // === Recording (browser video recording) ===
         "record" => {
             const VALID: &[&str] = &["start", "stop", "restart"];
@@ -2294,6 +2298,455 @@ fn parse_coverage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         None => Err(ParseError::MissingArguments {
             context: "coverage".to_string(),
             usage: COVERAGE_USAGE,
+        }),
+    }
+}
+
+fn parse_debug(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const DEBUG_USAGE: &str = "debug <enable|disable|status|scripts|source|breakpoint|logpoint|pause|resume|step-over|step-into|step-out|stack|eval|events> [options]";
+    let Some(subcommand) = rest.first().copied() else {
+        return Err(ParseError::MissingArguments {
+            context: "debug".to_string(),
+            usage: DEBUG_USAGE,
+        });
+    };
+    if subcommand == "source" {
+        return parse_debug_source(&rest[1..], id);
+    }
+    if matches!(subcommand, "breakpoint" | "logpoint") {
+        return parse_debug_probe(&rest[1..], id, subcommand);
+    }
+    let action = match subcommand {
+        "enable" => "debug_enable",
+        "disable" => "debug_disable",
+        "status" => "debug_status",
+        "scripts" => "debug_scripts",
+        "pause" => "debug_pause",
+        "resume" => "debug_resume",
+        "step-over" => "debug_step_over",
+        "step-into" => "debug_step_into",
+        "step-out" => "debug_step_out",
+        "stack" => "debug_stack",
+        "eval" => "debug_eval",
+        "events" => "debug_events",
+        unknown => {
+            return Err(ParseError::UnknownSubcommand {
+                subcommand: unknown.to_string(),
+                valid_options: &[
+                    "enable",
+                    "disable",
+                    "status",
+                    "scripts",
+                    "source",
+                    "breakpoint",
+                    "logpoint",
+                    "pause",
+                    "resume",
+                    "step-over",
+                    "step-into",
+                    "step-out",
+                    "stack",
+                    "eval",
+                    "events",
+                ],
+            });
+        }
+    };
+    let mut command = json!({ "id": id, "action": action });
+    let mut index = 1;
+
+    if subcommand == "eval" {
+        let expression = rest
+            .get(index)
+            .ok_or_else(|| ParseError::MissingArguments {
+                context: "debug eval".to_string(),
+                usage:
+                    "debug eval <expression> [--frame <index> | --call-frame-id <id>] [selectors]",
+            })?;
+        command["expression"] = json!(expression);
+        index += 1;
+    }
+
+    while index < rest.len() {
+        match rest[index] {
+            "--tab" | "--session" => {
+                let flag = rest[index];
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("debug {} {}", subcommand, flag),
+                        usage: DEBUG_USAGE,
+                    })?;
+                let key = match flag {
+                    "--tab" => "tabId",
+                    "--session" => "sessionId",
+                    _ => unreachable!(),
+                };
+                command[key] = json!(value);
+                index += 2;
+            }
+            "--pause-id"
+                if matches!(
+                    subcommand,
+                    "status" | "resume" | "step-over" | "step-into" | "step-out" | "stack" | "eval"
+                ) =>
+            {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("debug {} --pause-id", subcommand),
+                        usage: DEBUG_USAGE,
+                    })?;
+                command["pauseId"] = json!(value);
+                index += 2;
+            }
+            "--call-frame-id" if subcommand == "eval" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "debug eval --call-frame-id".to_string(),
+                        usage: DEBUG_USAGE,
+                    })?;
+                command["callFrameId"] = json!(value);
+                index += 2;
+            }
+            "--filter" if subcommand == "scripts" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "debug scripts --filter".to_string(),
+                        usage: DEBUG_USAGE,
+                    })?;
+                command["filter"] = json!(value);
+                index += 2;
+            }
+            "--frame" if subcommand == "eval" => {
+                let flag = rest[index];
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("debug {} {}", subcommand, flag),
+                        usage: DEBUG_USAGE,
+                    })?;
+                let parsed = value.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("Invalid value for {}: {}", flag, value),
+                    usage: DEBUG_USAGE,
+                })?;
+                command["frame"] = json!(parsed);
+                index += 2;
+            }
+            "--since" | "--wait" if subcommand == "events" => {
+                let flag = rest[index];
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("debug events {}", flag),
+                        usage: DEBUG_USAGE,
+                    })?;
+                let parsed = value.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("Invalid value for {}: {}", flag, value),
+                    usage: DEBUG_USAGE,
+                })?;
+                command[if flag == "--since" { "since" } else { "wait" }] = json!(parsed);
+                index += 2;
+            }
+            "--all-tabs" if matches!(subcommand, "enable" | "disable" | "status") => {
+                command["allTabs"] = json!(true);
+                index += 1;
+            }
+            "--resume" if subcommand == "disable" => {
+                command["resume"] = json!(true);
+                index += 1;
+            }
+            "--clear" if subcommand == "events" => {
+                command["clear"] = json!(true);
+                index += 1;
+            }
+            option => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown debug {} option: {}", subcommand, option),
+                    usage: DEBUG_USAGE,
+                });
+            }
+        }
+    }
+    validate_debug_selectors(&command, DEBUG_USAGE)?;
+    Ok(command)
+}
+
+fn validate_debug_selectors(command: &Value, usage: &'static str) -> Result<(), ParseError> {
+    let has_tab = command.get("tabId").is_some();
+    let has_session = command.get("sessionId").is_some();
+    let has_pause = command.get("pauseId").is_some();
+    let all_tabs = command
+        .get("allTabs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if has_tab && has_session {
+        return Err(ParseError::InvalidValue {
+            message: "--tab and --session are mutually exclusive".to_string(),
+            usage,
+        });
+    }
+    if has_pause && (has_tab || has_session) {
+        return Err(ParseError::InvalidValue {
+            message: "--pause-id cannot be combined with --tab or --session".to_string(),
+            usage,
+        });
+    }
+    if all_tabs && (has_tab || has_session || has_pause) {
+        return Err(ParseError::InvalidValue {
+            message: "--all-tabs cannot be combined with a tab, session, or pause selector"
+                .to_string(),
+            usage,
+        });
+    }
+    if command.get("frame").is_some() && command.get("callFrameId").is_some() {
+        return Err(ParseError::InvalidValue {
+            message: "--frame and --call-frame-id are mutually exclusive".to_string(),
+            usage,
+        });
+    }
+    Ok(())
+}
+
+fn parse_debug_source(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const SOURCE_USAGE: &str =
+        "debug source <script-id> [--tab <id> | --session <id>] | debug source search <query> [--filter <url>] [--max-results <count>] [selectors]";
+    let first = rest.first().ok_or_else(|| ParseError::MissingArguments {
+        context: "debug source".to_string(),
+        usage: SOURCE_USAGE,
+    })?;
+    let (mut command, mut index) = if *first == "search" {
+        let query = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+            context: "debug source search".to_string(),
+            usage: SOURCE_USAGE,
+        })?;
+        (
+            json!({ "id": id, "action": "debug_source_search", "query": query }),
+            2,
+        )
+    } else {
+        (
+            json!({ "id": id, "action": "debug_source", "scriptId": first }),
+            1,
+        )
+    };
+    while index < rest.len() {
+        match rest[index] {
+            "--tab" | "--session" => {
+                let flag = rest[index];
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("debug source {}", flag),
+                        usage: SOURCE_USAGE,
+                    })?;
+                let key = match flag {
+                    "--tab" => "tabId",
+                    "--session" => "sessionId",
+                    _ => unreachable!(),
+                };
+                command[key] = json!(value);
+                index += 2;
+            }
+            "--filter" if command["action"] == "debug_source_search" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "debug source search --filter".to_string(),
+                        usage: SOURCE_USAGE,
+                    })?;
+                command["filter"] = json!(value);
+                index += 2;
+            }
+            "--max-results" if command["action"] == "debug_source_search" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "debug source search --max-results".to_string(),
+                        usage: SOURCE_USAGE,
+                    })?;
+                command["maxResults"] =
+                    json!(parse_positive_u64(value, "--max-results", SOURCE_USAGE,)?);
+                index += 2;
+            }
+            option => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown debug source option: {}", option),
+                    usage: SOURCE_USAGE,
+                });
+            }
+        }
+    }
+    validate_debug_selectors(&command, SOURCE_USAGE)?;
+    Ok(command)
+}
+
+fn parse_debug_probe(rest: &[&str], id: &str, kind: &str) -> Result<Value, ParseError> {
+    const PROBE_USAGE: &str = "debug <breakpoint|logpoint> <set|list|remove> ...";
+    let operation = rest
+        .first()
+        .copied()
+        .ok_or_else(|| ParseError::MissingArguments {
+            context: format!("debug {}", kind),
+            usage: PROBE_USAGE,
+        })?;
+    let prefix = if kind == "breakpoint" {
+        "debug_breakpoint"
+    } else {
+        "debug_logpoint"
+    };
+    match operation {
+        "list" => {
+            if rest.len() != 1 {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown debug {} list option: {}", kind, rest[1]),
+                    usage: PROBE_USAGE,
+                });
+            }
+            Ok(json!({ "id": id, "action": format!("{}_list", prefix) }))
+        }
+        "remove" => {
+            let probe_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: format!("debug {} remove", kind),
+                usage: PROBE_USAGE,
+            })?;
+            if rest.len() != 2 {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown debug {} remove option: {}", kind, rest[2]),
+                    usage: PROBE_USAGE,
+                });
+            }
+            Ok(json!({
+                "id": id,
+                "action": format!("{}_remove", prefix),
+                "probeId": probe_id,
+            }))
+        }
+        "set" => {
+            let script_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: format!("debug {} set", kind),
+                usage: "debug <breakpoint|logpoint> set <script-id> <line> [options]",
+            })?;
+            let line = rest.get(2).ok_or_else(|| ParseError::MissingArguments {
+                context: format!("debug {} set {}", kind, script_id),
+                usage: "debug <breakpoint|logpoint> set <script-id> <line> [options]",
+            })?;
+            let line = parse_positive_u64(
+                line,
+                "line",
+                "debug <breakpoint|logpoint> set <script-id> <line> [options]",
+            )?;
+            let mut command = json!({
+                "id": id,
+                "action": format!("{}_set", prefix),
+                "scriptId": script_id,
+                "line": line,
+                "mode": "after",
+            });
+            let mut expressions: Vec<String> = Vec::new();
+            let mut tags = serde_json::Map::new();
+            let mut mode_flag: Option<&str> = None;
+            let mut index = 3;
+            while index < rest.len() {
+                match rest[index] {
+                    "--tab" | "--session" | "--condition" | "--expression" | "--when" | "--tag" => {
+                        let flag = rest[index];
+                        let value =
+                            rest.get(index + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: format!("debug {} set {}", kind, flag),
+                                    usage: PROBE_USAGE,
+                                })?;
+                        match flag {
+                            "--tab" => command["tabId"] = json!(value),
+                            "--session" => command["sessionId"] = json!(value),
+                            "--condition" if kind == "breakpoint" => {
+                                command["condition"] = json!(value)
+                            }
+                            "--expression" if kind == "logpoint" => {
+                                expressions.push((*value).to_string())
+                            }
+                            "--when" if kind == "logpoint" => command["when"] = json!(value),
+                            "--tag" => {
+                                let (key, value) = value.split_once('=').ok_or_else(|| {
+                                    ParseError::InvalidValue {
+                                        message: format!(
+                                            "Invalid --tag '{}': expected key=value",
+                                            value
+                                        ),
+                                        usage: PROBE_USAGE,
+                                    }
+                                })?;
+                                tags.insert(key.to_string(), json!(value));
+                            }
+                            _ => {
+                                return Err(ParseError::InvalidValue {
+                                    message: format!("{} is not valid for a {}", flag, kind),
+                                    usage: PROBE_USAGE,
+                                });
+                            }
+                        }
+                        index += 2;
+                    }
+                    "--column" | "--max-lines" | "--max-utf16-distance" => {
+                        let flag = rest[index];
+                        let value =
+                            rest.get(index + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: format!("debug {} set {}", kind, flag),
+                                    usage: PROBE_USAGE,
+                                })?;
+                        let value = parse_positive_u64(value, flag, PROBE_USAGE)?;
+                        if flag == "--column" {
+                            command["column"] = json!(value);
+                        } else if flag == "--max-lines" {
+                            command["maxLines"] = json!(value);
+                        } else {
+                            command["maxUtf16Distance"] = json!(value);
+                        }
+                        index += 2;
+                    }
+                    mode @ ("--strict" | "--before" | "--after" | "--nearest"
+                    | "--nearest-forward") => {
+                        if let Some(previous) = mode_flag {
+                            return Err(ParseError::InvalidValue {
+                                message: format!(
+                                    "Breakpoint resolution modes are mutually exclusive: {} and {}",
+                                    previous, mode
+                                ),
+                                usage: PROBE_USAGE,
+                            });
+                        }
+                        mode_flag = Some(mode);
+                        command["mode"] = json!(mode.trim_start_matches("--"));
+                        index += 1;
+                    }
+                    "--persist" => {
+                        command["persist"] = json!(true);
+                        index += 1;
+                    }
+                    option => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown debug {} set option: {}", kind, option),
+                            usage: PROBE_USAGE,
+                        });
+                    }
+                }
+            }
+            if !expressions.is_empty() {
+                command["expressions"] = json!(expressions);
+            }
+            if !tags.is_empty() {
+                command["tags"] = Value::Object(tags);
+            }
+            validate_debug_selectors(&command, PROBE_USAGE)?;
+            Ok(command)
+        }
+        unknown => Err(ParseError::UnknownSubcommand {
+            subcommand: unknown.to_string(),
+            valid_options: &["set", "list", "remove"],
         }),
     }
 }
@@ -5170,6 +5623,103 @@ mod tests {
 
         let unknown = parse_command(&args("coverage start --detailed"), &default_flags());
         assert!(matches!(unknown, Err(ParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_debug_pause_and_event_commands() {
+        let resume =
+            parse_command(&args("debug resume --pause-id pause-1-4"), &default_flags()).unwrap();
+        assert_eq!(resume["action"], "debug_resume");
+        assert_eq!(resume["pauseId"], "pause-1-4");
+
+        let status =
+            parse_command(&args("debug status --pause-id pause-1-4"), &default_flags()).unwrap();
+        assert_eq!(status["action"], "debug_status");
+        assert_eq!(status["pauseId"], "pause-1-4");
+
+        let events = parse_command(
+            &args("debug events --since 41 --wait 5000 --clear"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(events["action"], "debug_events");
+        assert_eq!(events["since"], 41);
+        assert_eq!(events["wait"], 5000);
+        assert_eq!(events["clear"], true);
+    }
+
+    #[test]
+    fn test_debug_source_and_probe_commands() {
+        let source = parse_command(
+            &args("debug source search checkout --filter assets --max-results 20"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(source["action"], "debug_source_search");
+        assert_eq!(source["query"], "checkout");
+        assert_eq!(source["filter"], "assets");
+        assert_eq!(source["maxResults"], 20);
+
+        let breakpoint = parse_command(
+            &args("debug breakpoint set 42 108 --column 3 --condition order.ready --strict --persist --tag runtime=host"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(breakpoint["action"], "debug_breakpoint_set");
+        assert_eq!(breakpoint["scriptId"], "42");
+        assert_eq!(breakpoint["line"], 108);
+        assert_eq!(breakpoint["column"], 3);
+        assert_eq!(breakpoint["mode"], "strict");
+        assert_eq!(breakpoint["persist"], true);
+        assert_eq!(breakpoint["tags"]["runtime"], "host");
+
+        let logpoint = parse_command(
+            &args("debug logpoint set 42 108 --expression order --expression cart.total --when order.ready --nearest --max-lines 3 --max-utf16-distance 256"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(logpoint["action"], "debug_logpoint_set");
+        assert_eq!(logpoint["expressions"], json!(["order", "cart.total"]));
+        assert_eq!(logpoint["when"], "order.ready");
+        assert_eq!(logpoint["mode"], "nearest");
+        assert_eq!(logpoint["maxLines"], 3);
+        assert_eq!(logpoint["maxUtf16Distance"], 256);
+    }
+
+    #[test]
+    fn test_debug_rejects_invalid_probe_options() {
+        assert!(parse_command(&args("debug breakpoint set 42 0"), &default_flags()).is_err());
+        assert!(parse_command(
+            &args("debug logpoint set 42 10 --condition true"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("debug breakpoint set 42 10 --expression x"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("debug breakpoint set 42 10 --strict --after"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("debug resume --tab t2 --pause-id pause-1-4"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("debug source 42 --tab t1 --session s1"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("debug eval x --frame 0 --call-frame-id frame-1"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(&args("debug source 42 --filter app"), &default_flags()).is_err());
     }
 
     // === Eval Tests ===
