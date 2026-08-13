@@ -891,6 +891,19 @@ impl BrowserManager {
     }
 
     pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+        self.navigate_with_timeout(url, wait_until, self.default_timeout_ms)
+            .await
+    }
+
+    /// Navigate and wait for the selected lifecycle state using the timeout
+    /// carried by the command. This keeps one-off `open --timeout` values and
+    /// the daemon's default timeout on the same lifecycle path.
+    pub async fn navigate_with_timeout(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+        timeout_ms: u64,
+    ) -> Result<Value, String> {
         let session_id = self.active_session_id()?.to_string();
         let mut lifecycle_rx = self.client.subscribe();
 
@@ -914,7 +927,7 @@ impl BrowserManager {
         // If loader_id is None, it was a same-document navigation (e.g., hash routing)
         // which does not fire Page.loadEventFired or Page.domContentEventFired.
         if nav_result.loader_id.is_some() && wait_until != WaitUntil::None {
-            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx, timeout_ms)
                 .await?;
         }
 
@@ -942,15 +955,18 @@ impl BrowserManager {
         wait_until: WaitUntil,
         session_id: &str,
         rx: &mut broadcast::Receiver<CdpEvent>,
+        timeout_ms: u64,
     ) -> Result<(), String> {
         let event_name = match wait_until {
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
-            WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
+            WaitUntil::NetworkIdle => {
+                return self.wait_for_network_idle(session_id, rx, timeout_ms).await
+            }
             WaitUntil::None => return Ok(()),
         };
 
-        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        let timeout = tokio::time::Duration::from_millis(timeout_ms);
 
         tokio::time::timeout(timeout, async {
             loop {
@@ -976,8 +992,9 @@ impl BrowserManager {
         &self,
         session_id: &str,
         rx: &mut broadcast::Receiver<CdpEvent>,
+        timeout_ms: u64,
     ) -> Result<(), String> {
-        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        let timeout = tokio::time::Duration::from_millis(timeout_ms);
         poll_network_idle(session_id, rx, timeout).await
     }
 
@@ -1074,7 +1091,7 @@ impl BrowserManager {
             }
         }
 
-        self.wait_for_lifecycle(wait_until, session_id, &mut rx)
+        self.wait_for_lifecycle(wait_until, session_id, &mut rx, self.default_timeout_ms)
             .await
     }
 

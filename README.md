@@ -111,7 +111,7 @@ agent-browser find role button click --name "Submit"
 
 ```bash
 agent-browser open                    # Launch browser (no navigation); stays on about:blank
-agent-browser open <url>              # Launch + navigate to URL (aliases: goto, navigate)
+agent-browser open <url> [--timeout <ms>] # Launch + navigate to URL (aliases: goto, navigate)
 agent-browser read [url]              # Fetch agent-readable text, or read rendered active-tab DOM
 agent-browser click <sel>             # Click element (--new-tab to open in new tab)
 agent-browser dblclick <sel>          # Double-click element
@@ -513,6 +513,7 @@ Heap snapshots and allocation profiles can contain page text, application data, 
 ### Navigation
 
 ```bash
+agent-browser open <url> --timeout 40000 # Wait up to 40s for the page load lifecycle event
 agent-browser back                    # Go back
 agent-browser forward                 # Go forward
 agent-browser reload                  # Reload page
@@ -1200,7 +1201,9 @@ Auto-discovered config files that are missing are silently ignored. If `--config
 
 ## Default Timeout
 
-The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the CLI's 30-second IPC read timeout so that the daemon returns a proper error instead of the CLI timing out with EAGAIN.
+The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the CLI's 30-second IPC read timeout so that the daemon returns a proper error instead of the CLI timing out with EAGAIN. Navigation commands (`open`, `goto`, and `navigate`) wait up to 60 seconds by default and receive a matching command transport budget.
+
+Pass `--timeout <ms>` to `open`, `goto`, or `navigate` to override the navigation lifecycle timeout for one command. `AGENT_BROWSER_DEFAULT_TIMEOUT` also overrides the navigation default. The effective navigation timeout is forwarded to the command transport with an additional response margin.
 
 Override the default timeout via environment variable:
 
@@ -1209,7 +1212,7 @@ Override the default timeout via environment variable:
 export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 ```
 
-> **Note:** Setting this above 30000 (30s) may cause EAGAIN errors on slow operations because the CLI's read timeout will expire before the daemon responds. The CLI retries transient errors automatically, but response times will increase.
+> **Note:** Navigation commands receive a transport budget that matches their effective timeout. For other slow operations, setting the environment variable above 30000 (30s) may still cause EAGAIN because their CLI read timeout can expire before the daemon responds.
 
 | Variable                        | Description                              |
 | ------------------------------- | ---------------------------------------- |

@@ -3834,7 +3834,7 @@ Start here (for AI agents):
   skills path [name]           Print skill directory path
 
 Core Commands:
-  open <url>                 Navigate to URL
+  open <url> [--timeout <ms>] Navigate to URL with an optional lifecycle timeout
   read [url]                 Fetch agent-readable text
   click <sel>                Click element (or @ref)
   dblclick <sel>             Double-click element
