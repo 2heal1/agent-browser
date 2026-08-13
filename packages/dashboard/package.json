@@ -1,6 +1,6 @@
 {
   "name": "dashboard",
-  "version": "0.33.2-divebell.6",
+  "version": "0.33.2-divebell.7",
   "private": true,
   "scripts": {
     "dev": "next dev",
