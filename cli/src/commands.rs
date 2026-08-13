@@ -333,11 +333,12 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
     let mut result = parse_command_inner(args, flags)?;
 
-    // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into any wait-family command that
-    // doesn't already carry an explicit timeout. Centralised here so that new
-    // wait variants automatically inherit the default without per-variant wiring.
+    // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into navigation and wait-family
+    // commands that do not already carry an explicit timeout. Keeping the
+    // effective timeout in the command also lets the client extend its IPC read
+    // budget beyond the ordinary 30-second floor.
     if let Some(action) = result.get("action").and_then(|a| a.as_str()) {
-        if action.starts_with("wait") && result.get("timeout").is_none() {
+        if (action == "navigate" || action.starts_with("wait")) && result.get("timeout").is_none() {
             if let Some(t) = flags.default_timeout {
                 result["timeout"] = json!(t);
             }
@@ -370,12 +371,31 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === Navigation ===
         // Maps to "navigate" action in protocol; reflected in ACTION_CATEGORIES in action-policy.ts
         "open" | "goto" | "navigate" => {
+            let timeout_index = rest.iter().position(|arg| *arg == "--timeout");
+            let timeout_ms = if let Some(index) = timeout_index {
+                let raw = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --timeout", cmd),
+                        usage: "open <url> [--timeout <ms>]",
+                    })?;
+                Some(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--timeout expects a number in ms, got '{}'", raw),
+                    usage: "open <url> [--timeout <ms>]",
+                })?)
+            } else {
+                None
+            };
+
             // `open` without a URL launches the browser but stays on
             // about:blank. Lets agents set up routes, cookies, or init
             // scripts before the first real navigation (see `batch`).
             // `goto` and `navigate` still require a URL since those verbs
             // imply the navigation itself.
-            let first_url = rest.iter().find(|a| !a.starts_with("--"));
+            let first_url = rest.iter().enumerate().find_map(|(index, arg)| {
+                let is_timeout_value = timeout_index.is_some_and(|timeout| index == timeout + 1);
+                (!arg.starts_with("--") && !is_timeout_value).then_some(arg)
+            });
             let url = match first_url {
                 Some(u) => *u,
                 None if cmd == "open" => {
@@ -390,6 +410,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             };
             let url = normalize_navigation_url(url);
             let mut nav_cmd = json!({ "id": id, "action": "navigate", "url": url });
+            if let Some(timeout) = timeout_ms {
+                nav_cmd["timeout"] = json!(timeout);
+            }
             if flags.provider.is_some() {
                 nav_cmd["waitUntil"] = json!("none");
             }
@@ -4546,6 +4569,51 @@ mod tests {
         let cmd = parse_command(&args("open example.com"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "navigate");
         assert_eq!(cmd["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_navigate_with_timeout() {
+        let cmd = parse_command(
+            &args("open https://example.com --timeout 42000"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "navigate");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["timeout"], 42000);
+    }
+
+    #[test]
+    fn test_navigate_timeout_before_url() {
+        let cmd = parse_command(
+            &args("goto --timeout 18000 https://example.com"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["timeout"], 18000);
+    }
+
+    #[test]
+    fn test_navigate_rejects_invalid_timeout() {
+        assert!(parse_command(
+            &args("open https://example.com --timeout nope"),
+            &default_flags(),
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("open https://example.com --timeout"),
+            &default_flags(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_navigate_inherits_default_timeout() {
+        let mut flags = default_flags();
+        flags.default_timeout = Some(33000);
+        let cmd = parse_command(&args("open https://example.com"), &flags).unwrap();
+        assert_eq!(cmd["timeout"], 33000);
     }
 
     #[test]

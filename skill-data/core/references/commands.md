@@ -8,7 +8,10 @@ Complete reference for all agent-browser commands. For quick start and common pa
 agent-browser open            # Launch browser (no navigation); stays on about:blank.
                               # Pair with `network route`, `cookies set --curl`, or
                               # `addinitscript` to stage state before the first navigation.
-agent-browser open <url>      # Launch + navigate (aliases: goto, navigate)
+agent-browser open <url> [--timeout <ms>]
+                              # Launch + navigate (aliases: goto, navigate)
+                              # Waits for the page load lifecycle event for 25s by default;
+                              # --timeout overrides that navigation wait for one command
                               # Supports: https://, http://, file://, about:, data://
                               # Auto-prepends https:// if no protocol given
 agent-browser read [url]      # Fetch agent-readable text, or read rendered active-tab DOM

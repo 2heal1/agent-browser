@@ -4583,6 +4583,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'url' parameter")?;
+    let timeout_ms = state.timeout_ms(cmd);
 
     {
         let df = state.domain_filter.read().await;
@@ -4666,7 +4667,9 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
-    let result = mgr.navigate(url, wait_until).await?;
+    let result = mgr
+        .navigate_with_timeout(url, wait_until, timeout_ms)
+        .await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }

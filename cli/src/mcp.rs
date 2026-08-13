@@ -808,7 +808,8 @@ fn tools() -> Vec<Value> {
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
-                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." }
+                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." },
+                "timeoutMs": { "type": "integer", "minimum": 0, "description": "Navigation lifecycle timeout in milliseconds. Omit to use AGENT_BROWSER_DEFAULT_TIMEOUT or 25000." }
             }),
             &[],
         ),
@@ -2698,6 +2699,10 @@ fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
             args.push(url);
         }
     }
+    if let Some(timeout) = optional_u64(arguments, "timeoutMs")? {
+        args.push("--timeout".to_string());
+        args.push(timeout.to_string());
+    }
     Ok(args)
 }
 
@@ -4455,6 +4460,7 @@ mod tests {
         let props = &open["inputSchema"]["properties"];
         assert!(props.get("headed").is_some());
         assert!(props.get("webgpu").is_some());
+        assert!(props.get("timeoutMs").is_some());
     }
 
     #[test]
@@ -4465,8 +4471,18 @@ mod tests {
         // Explicit true and false are both forwarded, so MCP callers can
         // override AGENT_BROWSER_WEBGPU/config just like `--webgpu false`.
         assert_eq!(
-            open_args(&json!({ "webgpu": false, "url": "https://example.com" })).unwrap(),
-            vec!["--webgpu", "false", "open", "https://example.com"]
+            open_args(
+                &json!({ "webgpu": false, "url": "https://example.com", "timeoutMs": 42000 })
+            )
+            .unwrap(),
+            vec![
+                "--webgpu",
+                "false",
+                "open",
+                "https://example.com",
+                "--timeout",
+                "42000"
+            ]
         );
         assert_eq!(
             open_args(&json!({ "headed": true, "webgpu": true })).unwrap(),
