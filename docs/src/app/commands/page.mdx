@@ -515,7 +515,7 @@ agent-browser pushstate <url>         # SPA client-side nav; auto-detects window
                                       # falls back to history.pushState + popstate
 ```
 
-`open`, `goto`, and `navigate` wait up to 25 seconds for the selected navigation lifecycle event by default. Pass `--timeout <ms>` to override that wait for one navigation. The effective timeout is also forwarded to the command transport with an additional response margin.
+`open`, `goto`, and `navigate` wait up to 60 seconds for the selected navigation lifecycle event by default. Pass `--timeout <ms>` to override that wait for one navigation. `AGENT_BROWSER_DEFAULT_TIMEOUT` also overrides the navigation default. The effective timeout is forwarded to the command transport with an additional response margin.
 
 ## Pre-navigation setup
 

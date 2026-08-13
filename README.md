@@ -1201,9 +1201,9 @@ Auto-discovered config files that are missing are silently ignored. If `--config
 
 ## Default Timeout
 
-The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the CLI's 30-second IPC read timeout so that the daemon returns a proper error instead of the CLI timing out with EAGAIN.
+The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the CLI's 30-second IPC read timeout so that the daemon returns a proper error instead of the CLI timing out with EAGAIN. Navigation commands (`open`, `goto`, and `navigate`) wait up to 60 seconds by default and receive a matching command transport budget.
 
-Pass `--timeout <ms>` to `open`, `goto`, or `navigate` to override the navigation lifecycle timeout for one command. The effective navigation timeout is forwarded to the command transport with an additional response margin.
+Pass `--timeout <ms>` to `open`, `goto`, or `navigate` to override the navigation lifecycle timeout for one command. `AGENT_BROWSER_DEFAULT_TIMEOUT` also overrides the navigation default. The effective navigation timeout is forwarded to the command transport with an additional response margin.
 
 Override the default timeout via environment variable:
 
@@ -1212,7 +1212,7 @@ Override the default timeout via environment variable:
 export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 ```
 
-> **Note:** Setting this above 30000 (30s) may cause EAGAIN errors on slow operations because the CLI's read timeout will expire before the daemon responds. The CLI retries transient errors automatically, but response times will increase.
+> **Note:** Navigation commands receive a transport budget that matches their effective timeout. For other slow operations, setting the environment variable above 30000 (30s) may still cause EAGAIN because their CLI read timeout can expire before the daemon responds.
 
 | Variable                        | Description                              |
 | ------------------------------- | ---------------------------------------- |

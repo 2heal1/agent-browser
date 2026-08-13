@@ -10,7 +10,7 @@ agent-browser open            # Launch browser (no navigation); stays on about:b
                               # `addinitscript` to stage state before the first navigation.
 agent-browser open <url> [--timeout <ms>]
                               # Launch + navigate (aliases: goto, navigate)
-                              # Waits for the page load lifecycle event for 25s by default;
+                              # Waits for the page load lifecycle event for 60s by default;
                               # --timeout overrides that navigation wait for one command
                               # Supports: https://, http://, file://, about:, data://
                               # Auto-prepends https:// if no protocol given

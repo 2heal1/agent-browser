@@ -330,17 +330,25 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+const NAVIGATION_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
     let mut result = parse_command_inner(args, flags)?;
 
-    // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into navigation and wait-family
-    // commands that do not already carry an explicit timeout. Keeping the
-    // effective timeout in the command also lets the client extend its IPC read
-    // budget beyond the ordinary 30-second floor.
+    // Stamp navigation commands with their effective timeout and inject
+    // AGENT_BROWSER_DEFAULT_TIMEOUT into wait-family commands when configured.
+    // Keeping the effective timeout in the command also lets the client extend
+    // its IPC read budget beyond the ordinary 30-second floor.
     if let Some(action) = result.get("action").and_then(|a| a.as_str()) {
-        if (action == "navigate" || action.starts_with("wait")) && result.get("timeout").is_none() {
-            if let Some(t) = flags.default_timeout {
-                result["timeout"] = json!(t);
+        if result.get("timeout").is_none() {
+            if action == "navigate" {
+                result["timeout"] = json!(flags
+                    .default_timeout
+                    .unwrap_or(NAVIGATION_DEFAULT_TIMEOUT_MS));
+            } else if action.starts_with("wait") {
+                if let Some(t) = flags.default_timeout {
+                    result["timeout"] = json!(t);
+                }
             }
         }
     }
@@ -4614,6 +4622,12 @@ mod tests {
         flags.default_timeout = Some(33000);
         let cmd = parse_command(&args("open https://example.com"), &flags).unwrap();
         assert_eq!(cmd["timeout"], 33000);
+    }
+
+    #[test]
+    fn test_navigate_uses_one_minute_default_timeout() {
+        let cmd = parse_command(&args("open https://example.com"), &default_flags()).unwrap();
+        assert_eq!(cmd["timeout"], 60_000);
     }
 
     #[test]

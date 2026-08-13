@@ -1058,9 +1058,8 @@ fn has_os_error(error: &str, code: u32) -> bool {
 }
 
 /// Socket read timeout for one request. Ordinary commands get a 30s floor.
-/// Commands carrying an operation timeout (navigation and the wait family,
-/// which parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no
-/// explicit --timeout is given) get that timeout plus margin, so the daemon can
+/// Commands carrying an operation timeout (navigation and the wait family)
+/// get that timeout plus margin, so the daemon can
 /// report a proper operation timeout instead of the client dying with EAGAIN
 /// at 30s and the retry loop re-sending the whole long-running command.
 ///

@@ -809,7 +809,7 @@ fn tools() -> Vec<Value> {
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
                 "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." },
-                "timeoutMs": { "type": "integer", "minimum": 0, "description": "Navigation lifecycle timeout in milliseconds. Omit to use AGENT_BROWSER_DEFAULT_TIMEOUT or 25000." }
+                "timeoutMs": { "type": "integer", "minimum": 0, "description": "Navigation lifecycle timeout in milliseconds. Omit to use AGENT_BROWSER_DEFAULT_TIMEOUT or 60000." }
             }),
             &[],
         ),
