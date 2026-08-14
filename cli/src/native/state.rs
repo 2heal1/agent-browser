@@ -301,7 +301,8 @@ async fn navigate_to_intercepted_origin(
 }
 
 fn blank_html_response_b64() -> String {
-    let body = "<html></html>";
+    // Keep Chrome from requesting /favicon.ico after the intercepted document loads.
+    let body = r#"<html><head><link rel="icon" href="data:,"></head></html>"#;
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
