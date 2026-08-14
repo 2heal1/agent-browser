@@ -78,6 +78,7 @@ Changes listed here are carried by the Divebell release branch until they are av
 - **Restore State save stages (`0.33.2-divebell.5`):** Initial, periodic, and close-time saves are independently configurable on each command, including commands sent to an existing daemon. Cross-origin storage collection prefers a background CDP target and retains a compatibility fallback.
 - **Compiled JavaScript debugger (`0.33.2-divebell.6`):** A lock-independent Chrome debugger control plane can inspect and resume paused JavaScript from a second CLI or MCP client. It provides compiled-source discovery and search, one-based UTF-16 breakpoint locations, conditional breakpoints, non-pausing logpoints, lifecycle events, and explicit `debug.inspect`, `debug.control`, and `evaluate` policy gates without requiring source files or source maps.
 - **Navigation lifecycle timeouts (`0.33.2-divebell.7`):** `open`, `goto`, and `navigate` accept a per-command `--timeout`, default to a 60-second lifecycle wait, honor `AGENT_BROWSER_DEFAULT_TIMEOUT`, and carry the effective timeout into the IPC response budget. The MCP open tool exposes the same option as `timeoutMs`.
+- **Active page context (`0.33.2-divebell.8`):** Partial launch envelopes inherit omitted options from the active browser configuration, so follow-up page commands reuse the page opened by the caller instead of relaunching Chrome at `about:blank`.
 
 ## Publishing the Divebell package
 
