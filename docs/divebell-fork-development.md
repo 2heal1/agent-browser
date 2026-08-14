@@ -8,13 +8,9 @@ to the Divebell fork at [`2heal1/agent-browser`](https://github.com/2heal1/agent
 ## Branch relationship
 
 ```text
-upstream/main
+upstream/vX.Y.Z
     |
-    | rebase
-    v
-feat/memory-diagnostics
-    |
-    | base for the Divebell package changes
+    | merge through codex/sync-upstream-vX.Y.Z
     v
 codex/openruntime-agent-browser-release
     |
@@ -23,35 +19,35 @@ codex/openruntime-agent-browser-release
 codex/<feature>
 ```
 
-- `upstream/main` is the authoritative agent-browser history.
-- `feat/memory-diagnostics` contains only the reusable memory and coverage
-  diagnostics. Rebase it directly onto `upstream/main`.
-- `codex/openruntime-agent-browser-release` contains the diagnostics plus the
-  Divebell package identity and release workflow. Rebase its release-only
-  commits onto the updated diagnostics branch.
+- `upstream/main` is the authoritative agent-browser development history. Sync
+  a released version tag so the imported baseline is reproducible.
+- `codex/openruntime-agent-browser-release` contains published Divebell package
+  history and fork-only features. Never rebase or force-push this branch after
+  a Divebell tag has been published.
+- Sync upstream through a dedicated `codex/sync-upstream-vX.Y.Z` branch and a
+  merge commit. This preserves both the upstream boundary and existing
+  Divebell tag ancestry.
 - Every new fork feature starts from the release branch on its own
   `codex/<feature>` branch. Merge it back only after review and verification.
 - A generally useful change should also be proposed upstream. Keep the fork
-  commit isolated until upstream accepts it; the next rebase can then drop the
-  duplicate fork commit.
+  commit isolated until upstream accepts it; a later sync can then remove the
+  duplicate fork implementation in a focused follow-up.
 
 ## Updating from upstream
 
 ```bash
 git fetch upstream --tags
-git switch feat/memory-diagnostics
-git rebase upstream/main
-git push --force-with-lease origin feat/memory-diagnostics
-
-git switch codex/openruntime-agent-browser-release
-git rebase --onto feat/memory-diagnostics <old-memory-commit> codex/openruntime-agent-browser-release
-git push --force-with-lease origin codex/openruntime-agent-browser-release
+git fetch origin codex/openruntime-agent-browser-release
+git switch -c codex/sync-upstream-v0.34.0 origin/codex/openruntime-agent-browser-release
+git merge --no-ff v0.34.0
+# Resolve conflicts, preserve the @divebell package identity, and run the full checks.
+git push -u origin codex/sync-upstream-v0.34.0
 ```
 
-Replace `<old-memory-commit>` with the former memory-diagnostics commit at the
-base of the release branch. Confirm with `git log --graph` that the release
-branch contains one memory-diagnostics commit followed by its release-only
-commits.
+Open a pull request from the sync branch into
+`codex/openruntime-agent-browser-release`. Update the example tag and branch for
+each upstream release; do not merge a moving `upstream/main` ref into the
+release branch.
 
 ## Feature delivery
 
@@ -84,7 +80,7 @@ Changes listed here are carried by the Divebell release branch until they are av
 
 The published npm package is `@divebell/agent-browser`. Its version tracks the
 upstream version and adds a Divebell prerelease suffix, for example
-`0.33.2-divebell.1`.
+`0.34.0-divebell.1`.
 
 1. Update the root package version and run `pnpm version:sync`.
 2. Run the Rust tests and package checks locally.

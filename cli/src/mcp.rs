@@ -1281,15 +1281,15 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_SWITCH,
             "Tab switch",
-            "Switch to a tab by id or label.",
-            json!({ "tab": { "type": "string" } }),
+            "Switch to a tab by id (t1), label, or CDP target id. Switching also binds the session to that tab.",
+            json!({ "tab": { "type": "string", "description": "Tab id (t1), label, or CDP target id." } }),
             &["tab"],
         ),
         tool(
             TOOL_TAB_CLOSE,
             "Tab close",
-            "Close a tab.",
-            json!({ "tab": { "type": "string" } }),
+            "Close a tab by id (t1), label, or CDP target id. Omit to close the current tab.",
+            json!({ "tab": { "type": "string", "description": "Tab id (t1), label, or CDP target id." } }),
             &[],
         ),
         tool(
@@ -1872,8 +1872,11 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONNECT,
             "Connect CDP",
-            "Connect to a browser over CDP.",
-            json!({ "target": { "type": "string", "description": "CDP port or URL." } }),
+            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state.",
+            json!({
+                "target": { "type": "string", "description": "CDP port or URL." },
+                "pinTab": { "type": "boolean", "description": "Strict session-to-tab binding (sticky for the session). Explicit false disables a sticky pin; omitted leaves it unchanged." }
+            }),
             &["target"],
         ),
         tool(
@@ -2548,7 +2551,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_REMOVE_INIT_SCRIPT => call_one_string(arguments, "removeinitscript", "id"),
         TOOL_CONFIRM => call_one_string(arguments, "confirm", "id"),
         TOOL_DENY => call_one_string(arguments, "deny", "id"),
-        TOOL_CONNECT => call_one_string(arguments, "connect", "target"),
+        TOOL_CONNECT => call_connect(arguments),
         TOOL_STREAM_ENABLE => call_stream_enable(arguments),
         TOOL_STREAM_DISABLE => call_literal(arguments, &["stream", "disable"]),
         TOOL_STREAM_STATUS => call_literal(arguments, &["stream", "status"]),
@@ -2652,6 +2655,17 @@ fn call_literal(arguments: &Value, parts: &[&str]) -> Result<Value, ProtocolErro
 fn call_one_string(arguments: &Value, command: &str, key: &str) -> Result<Value, ProtocolError> {
     let mut args = command_parts(command);
     args.push(required_string(arguments, key)?);
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["connect".to_string()];
+    args.push(required_string(arguments, "target")?);
+    match arguments.get("pinTab").and_then(|v| v.as_bool()) {
+        Some(true) => args.push("--pin-tab".to_string()),
+        Some(false) => args.push("--no-pin-tab".to_string()),
+        None => {}
+    }
     call_cli_tool(arguments, args, None)
 }
 
@@ -5097,6 +5111,36 @@ mod tests {
     fn required_string_reads_present_field() {
         let value = required_string(&json!({ "selector": "@e1" }), "selector").unwrap();
         assert_eq!(value, "@e1");
+    }
+
+    #[test]
+    fn tool_result_preserves_tab_gone_recovery_data() {
+        let run = CliRun {
+            exit_code: Some(1),
+            stdout: json!({
+                "success": false,
+                "data": {
+                    "targetId": "DEAD_TARGET",
+                    "lastUrl": "https://example.com/path"
+                },
+                "error": "tab_gone: bound tab is gone",
+                "code": "tab_gone"
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let result = tool_result_from_run(run);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["exitCode"], 1);
+        assert_eq!(
+            result["structuredContent"]["response"]["data"]["targetId"],
+            "DEAD_TARGET"
+        );
+        assert_eq!(
+            result["structuredContent"]["response"]["data"]["lastUrl"],
+            "https://example.com/path"
+        );
     }
 
     #[test]
