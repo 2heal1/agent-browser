@@ -98,6 +98,14 @@ fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, 
     }
 }
 
+fn attach_pin_tab_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.pin_tab {
+        cmd["pinTab"] = json!(true);
+    } else if flags.cli_pin_tab {
+        cmd["pinTab"] = json!(false);
+    }
+}
+
 fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::PluginConfig]) {
     cmd["plugins"] = json!(plugins);
 }
@@ -1182,6 +1190,8 @@ fn main() {
     // current config without a restart. The daemon strips this from stream
     // broadcasts before observers see the command payload.
     attach_plugins_to_command(&mut cmd, &flags.plugins);
+
+    attach_pin_tab_to_command(&mut cmd, &flags);
     attach_restore_config_to_command(&mut cmd, &flags);
 
     let restore_key = restore_key_from_flags(&flags);
@@ -1225,6 +1235,7 @@ fn main() {
                 data: Some(data),
                 error: None,
                 error_code: None,
+                code: None,
                 warning: None,
             },
             Err(e) => connection::Response {
@@ -1232,6 +1243,7 @@ fn main() {
                 data: None,
                 error: Some(e),
                 error_code: None,
+                code: None,
                 warning: None,
             },
         };
@@ -1293,6 +1305,7 @@ fn main() {
         confirm_actions: flags.confirm_actions.as_deref(),
         engine: flags.engine.as_deref(),
         auto_connect: flags.auto_connect,
+        pin_tab: flags.pin_tab,
         idle_timeout: flags.idle_timeout.as_deref(),
         default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
@@ -1324,6 +1337,7 @@ fn main() {
         });
         attach_script_launch_options(&mut launch_cmd, &flags);
         attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
@@ -1421,6 +1435,7 @@ fn main() {
         let mut launch_cmd = launch_cmd;
         attach_script_launch_options(&mut launch_cmd, &flags);
         attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
@@ -1796,15 +1811,30 @@ fn run_batch(
         attach_plugins_to_command(&mut parsed, &flags.plugins);
         attach_restore_config_to_command(&mut parsed, flags);
 
+        attach_pin_tab_to_command(&mut parsed, flags);
+
         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {
                 if flags.json {
-                    results.push(json!({
+                    let mut result = json!({
                         "command": cmd_args,
                         "success": resp.success,
                         "result": resp.data,
                         "error": resp.error,
-                    }));
+                    });
+                    // Match the single-command `Response` serialization,
+                    // which only emits `code` when set (e.g. `tab_gone`).
+                    // Without this, machine-readable error codes are
+                    // silently dropped in batch mode.
+                    if let Some(ref code) = resp.code {
+                        result["code"] = json!(code);
+                    }
+                    // Mirror the single-command serialization: emit `warning`
+                    // too, not just `code`.
+                    if let Some(ref warning) = resp.warning {
+                        result["warning"] = json!(warning);
+                    }
+                    results.push(result);
                 } else {
                     if i > 0 {
                         println!();
@@ -1986,6 +2016,47 @@ mod tests {
             cmd["allowedDomains"],
             json!(["example.com", "*.example.org"])
         );
+    }
+
+    #[test]
+    fn test_attach_pin_tab_to_command_preserves_preference() {
+        let mut flags = neutral_launch_config_flags();
+
+        let mut absent_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut absent_cmd, &flags);
+        assert!(absent_cmd.get("pinTab").is_none());
+
+        flags.pin_tab = true;
+        let mut enabled_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut enabled_cmd, &flags);
+        assert_eq!(enabled_cmd["pinTab"], true);
+
+        flags.pin_tab = false;
+        flags.cli_pin_tab = true;
+        let mut disabled_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut disabled_cmd, &flags);
+        assert_eq!(disabled_cmd["pinTab"], false);
+    }
+
+    #[test]
+    fn test_published_schemas_define_pin_tab_boolean() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        let root_pin_tab = &root_schema["properties"]["pinTab"];
+        let docs_pin_tab = &docs_schema["properties"]["pinTab"];
+        assert_eq!(root_pin_tab["type"], "boolean");
+        assert_eq!(docs_pin_tab["type"], "boolean");
+        assert_eq!(root_pin_tab, docs_pin_tab);
     }
 
     #[test]
@@ -2209,6 +2280,7 @@ mod tests {
     fn test_confirmation_prompt_from_response_finds_nested_confirm_result() {
         let resp = Response {
             success: true,
+            code: None,
             data: Some(json!({
                 "confirmed": true,
                 "action": "navigate",
