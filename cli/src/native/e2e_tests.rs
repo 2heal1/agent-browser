@@ -6328,6 +6328,64 @@ async fn e2e_relaunch_on_options_change() {
     assert_success(&resp);
 }
 
+/// A follow-up launch request may repeat one option while omitting the rest.
+/// Omitted options inherit the active browser configuration so commands such
+/// as screenshot and URL reads do not destroy the page opened by the caller.
+#[tokio::test]
+#[ignore]
+async fn e2e_partial_launch_preserves_open_page() {
+    let profile_dir = tempfile::tempdir().expect("browser profile directory");
+    let profile = profile_dir.path().to_string_lossy().to_string();
+    let target_url = native_test_fixture_url("memory_probe");
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "profile": &profile,
+            "args": ["about:blank"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": &target_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "launch", "profile": &profile }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["reused"],
+        true,
+        "partial launch options must reuse the current browser: {}",
+        resp
+    );
+    assert_eq!(
+        get_data(&resp)["lifecycle"]["relaunchedBrowser"],
+        false,
+        "partial launch options must not replace the current page: {}",
+        resp
+    );
+
+    let resp = execute_command(&json!({ "id": "4", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["url"], target_url);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // ---------------------------------------------------------------------------
 // Stream: custom viewport is reflected in screencast frame metadata
 // ---------------------------------------------------------------------------

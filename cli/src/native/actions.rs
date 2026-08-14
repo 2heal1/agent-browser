@@ -445,6 +445,11 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Caller-supplied launch options used to create the current browser before
+    /// launch-mutator plugins are applied. Partial follow-up launch requests
+    /// inherit omitted values from this configuration so a read-only command
+    /// cannot accidentally relaunch the browser with defaults.
+    active_launch_options: Option<LaunchOptions>,
     /// Effective built-in features and user scripts used by the active browser.
     /// Partial follow-up launch requests inherit these values instead of
     /// accidentally replacing them with empty lists and relaunching.
@@ -580,6 +585,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            active_launch_options: None,
             active_enable_features: Vec::new(),
             active_init_script_paths: Vec::new(),
             network_auto_attach_installed: false,
@@ -2120,6 +2126,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 
     close_active_provider_session(state).await;
     state.launch_hash = None;
+    state.active_launch_options = None;
     state.active_enable_features.clear();
     state.active_init_script_paths.clear();
     state.network_auto_attach_installed = false;
@@ -3302,6 +3309,7 @@ async fn auto_launch(
     let init_script_paths = launch_init_script_paths_from_env();
     let allowed_domains = current_allowed_domains(state).await;
     options.restrict_webrtc = !allowed_domains.is_empty();
+    let requested_launch_options = options.clone();
 
     // Extract storage_state before options is moved into BrowserManager::launch.
     let storage_state_path = options.storage_state.clone();
@@ -3349,6 +3357,7 @@ async fn auto_launch(
         state.reset_input_state();
         state.browser = Some(mgr);
         state.launch_hash = Some(hash);
+        state.active_launch_options = Some(requested_launch_options.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -3385,6 +3394,7 @@ async fn auto_launch(
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
         state.launch_hash = Some(hash);
+        state.active_launch_options = Some(requested_launch_options.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -3449,6 +3459,7 @@ async fn auto_launch(
                     state.reset_input_state();
                     state.browser = Some(mgr);
                     state.launch_hash = Some(hash);
+                    state.active_launch_options = Some(requested_launch_options.clone());
                     remember_active_provider_session(state, conn.session.clone(), &plugins);
                     state.subscribe_to_browser_events();
                     state.start_fetch_handler();
@@ -3510,6 +3521,7 @@ async fn auto_launch(
     state.reset_input_state();
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
+    state.active_launch_options = Some(requested_launch_options);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();
@@ -4088,13 +4100,19 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 // ---------------------------------------------------------------------------
 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    // Absent field falls back to the daemon's spawn-time env (mirrors
-    // hideScrollbars/webgpu), keeping the launch hash stable when follow-up
-    // commands send launch envelopes without an explicit headed choice.
+    // A launch envelope is a partial update. Start with the active browser's
+    // requested launch configuration, or the daemon's spawn-time environment
+    // before the first browser exists, and only replace fields present in the
+    // command. This keeps read-only follow-up commands on the current page
+    // when a client repeats one launch option such as `profile`.
+    let active_launch_options = state
+        .active_launch_options
+        .clone()
+        .unwrap_or_else(launch_options_from_env);
     let headless = cmd
         .get("headless")
         .and_then(|v| v.as_bool())
-        .unwrap_or_else(|| !headed_from_env());
+        .unwrap_or(active_launch_options.headless);
     let cdp_url = cmd.get("cdpUrl").and_then(|v| v.as_str());
     let cdp_port = cmd.get("cdpPort").and_then(|v| v.as_u64());
     let auto_connect = cmd
@@ -4113,23 +4131,30 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         &state.active_init_script_paths,
     );
 
-    let extensions: Option<Vec<String>> =
+    let extensions: Option<Vec<String>> = if cmd.get("extensions").is_some() {
         cmd.get("extensions").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
-        });
+        })
+    } else {
+        active_launch_options.extensions.clone()
+    };
     let storage_state = cmd.get("storageState").and_then(|v| v.as_str());
     let storage_state_owned = storage_state.map(|s| s.to_string());
     let engine = cmd
         .get("engine")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
-    let profile = cmd
-        .get("profile")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok())
+        .or_else(|| Some(state.engine.clone()));
+    let profile = if cmd.get("profile").is_some() {
+        cmd.get("profile")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        active_launch_options.profile.clone()
+    };
 
     let requested_allowed_domains = allowed_domains_from_launch_command(cmd);
     let previous_domain_filter = state.domain_filter.read().await.clone();
@@ -4143,15 +4168,54 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| state.session_name.clone());
-    let launch_args: Vec<String> = cmd
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
+    let launch_args: Vec<String> = if cmd.get("args").is_some() {
+        cmd.get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        active_launch_options.args.clone()
+    };
+
+    let proxy = if cmd.get("proxy").is_some() {
+        cmd.get("proxy").and_then(|v| {
+            v.as_str().map(|s| s.to_string()).or_else(|| {
+                v.get("server")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
         })
-        .unwrap_or_default();
+    } else {
+        active_launch_options.proxy.clone()
+    };
+    let proxy_bypass = if cmd.get("proxy").is_some() {
+        cmd.get("proxy")
+            .and_then(|v| v.get("bypass"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        active_launch_options.proxy_bypass.clone()
+    };
+    let proxy_username = if cmd.get("proxy").is_some() {
+        cmd.get("proxy")
+            .and_then(|v| v.get("username"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        active_launch_options.proxy_username.clone()
+    };
+    let proxy_password = if cmd.get("proxy").is_some() {
+        cmd.get("proxy")
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        active_launch_options.proxy_password.clone()
+    };
 
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -4167,66 +4231,68 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let mut launch_options = LaunchOptions {
         headless,
-        executable_path: cmd
-            .get("executablePath")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok()),
-        proxy: cmd.get("proxy").and_then(|v| {
-            v.as_str().map(|s| s.to_string()).or_else(|| {
-                v.get("server")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            })
-        }),
-        proxy_bypass: cmd
-            .get("proxy")
-            .and_then(|v| v.get("bypass"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        proxy_username: cmd
-            .get("proxy")
-            .and_then(|v| v.get("username"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_USERNAME").ok()),
-        proxy_password: cmd
-            .get("proxy")
-            .and_then(|v| v.get("password"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_PASSWORD").ok()),
+        executable_path: if cmd.get("executablePath").is_some() {
+            cmd.get("executablePath")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        } else {
+            active_launch_options.executable_path.clone()
+        },
+        proxy,
+        proxy_bypass,
+        proxy_username,
+        proxy_password,
         profile,
         allow_file_access: cmd
             .get("allowFileAccess")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+            .unwrap_or(active_launch_options.allow_file_access),
         args: launch_args,
         extensions,
         storage_state: storage_state.map(String::from),
-        user_agent: cmd
-            .get("userAgent")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        user_agent: if cmd.get("userAgent").is_some() {
+            cmd.get("userAgent")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        } else {
+            active_launch_options.user_agent.clone()
+        },
         ignore_https_errors: cmd
             .get("ignoreHTTPSErrors")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        color_scheme: cmd
-            .get("colorScheme")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        download_path: cmd
-            .get("downloadPath")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        hide_scrollbars: hide_scrollbars_from_launch_cmd(cmd),
-        viewport_size: None,
-        use_real_keychain: false,
-        webgpu: webgpu_from_launch_cmd(cmd),
-        no_xvfb: no_xvfb_from_launch_cmd(cmd),
+            .unwrap_or(active_launch_options.ignore_https_errors),
+        color_scheme: if cmd.get("colorScheme").is_some() {
+            cmd.get("colorScheme")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        } else {
+            active_launch_options.color_scheme.clone()
+        },
+        download_path: if cmd.get("downloadPath").is_some() {
+            cmd.get("downloadPath")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        } else {
+            active_launch_options.download_path.clone()
+        },
+        hide_scrollbars: cmd
+            .get("hideScrollbars")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(active_launch_options.hide_scrollbars),
+        viewport_size: active_launch_options.viewport_size,
+        use_real_keychain: active_launch_options.use_real_keychain,
+        webgpu: cmd
+            .get("webgpu")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(active_launch_options.webgpu),
+        no_xvfb: cmd
+            .get("noXvfb")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(active_launch_options.no_xvfb),
         restrict_webrtc,
     };
+
+    let requested_launch_options = launch_options.clone();
 
     state.plugin_init_scripts.clear();
     let local_launch =
@@ -4297,6 +4363,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
+        state.active_launch_options = Some(requested_launch_options.clone());
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();
@@ -4326,6 +4393,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
         state.launch_hash = Some(new_hash);
+        state.active_launch_options = Some(requested_launch_options.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -4341,6 +4409,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
         state.launch_hash = Some(new_hash);
+        state.active_launch_options = Some(requested_launch_options.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -4356,6 +4425,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
         state.launch_hash = Some(new_hash);
+        state.active_launch_options = Some(requested_launch_options.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -4406,6 +4476,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         state.reset_input_state();
                         state.browser = Some(mgr);
                         state.launch_hash = Some(new_hash);
+                        state.active_launch_options = Some(requested_launch_options.clone());
                         remember_active_provider_session(
                             state,
                             conn.session.clone(),
@@ -4464,6 +4535,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.reset_input_state();
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
+    state.active_launch_options = Some(requested_launch_options);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();
