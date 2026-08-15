@@ -293,6 +293,8 @@ jobs:
           agent-browser --version
         shell: bash
 
+      # Divebell intentionally keeps npm's global entry pointed at the package
+      # wrapper, which selects and launches the bundled native binary.
       - name: Verify symlink points to package wrapper (Unix)
         if: runner.os != 'Windows'
         run: |
