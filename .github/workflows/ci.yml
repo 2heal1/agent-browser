@@ -293,21 +293,21 @@ jobs:
           agent-browser --version
         shell: bash
 
-      - name: Verify symlink points to native binary (Unix)
+      - name: Verify symlink points to package wrapper (Unix)
         if: runner.os != 'Windows'
         run: |
           SYMLINK=$(npm prefix -g)/bin/agent-browser
           TARGET=$(readlink "$SYMLINK")
           echo "Symlink: $SYMLINK"
           echo "Target: $TARGET"
-          if [[ "$TARGET" != *"${{ matrix.binary }}"* ]]; then
-            echo "ERROR: Symlink should point to native binary, not JS wrapper"
+          if [[ "$TARGET" != *"@divebell/agent-browser/bin/agent-browser.js"* ]]; then
+            echo "ERROR: Symlink should point to the Divebell package wrapper"
             exit 1
           fi
-          echo "Symlink correctly points to native binary"
+          echo "Symlink correctly points to the Divebell package wrapper"
         shell: bash
 
-      - name: Verify shim points to native binary (Windows)
+      - name: Verify shim points to package wrapper (Windows)
         if: runner.os == 'Windows'
         run: |
           $shimPath = "$(npm prefix -g)\agent-browser.cmd"
@@ -315,11 +315,11 @@ jobs:
           echo "Shim path: $shimPath"
           echo "Shim content:"
           echo $content
-          if ($content -notmatch "agent-browser-win32-x64\.exe") {
-            echo "ERROR: Shim should point to native .exe, not JS wrapper"
+          if ($content -notmatch "@divebell[\\/]agent-browser[\\/]bin[\\/]agent-browser\.js") {
+            echo "ERROR: Shim should point to the Divebell package wrapper"
             exit 1
           }
-          echo "Shim correctly points to native binary"
+          echo "Shim correctly points to the Divebell package wrapper"
         shell: pwsh
 
   node20-runtime:
