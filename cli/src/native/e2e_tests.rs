@@ -3243,6 +3243,72 @@ async fn e2e_save_state_collects_explicit_included_origin() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_state_save_bounds_unreachable_included_origin_and_cleans_up_target() {
+    let output = tempfile::tempdir().unwrap();
+    let state_path = output.path().join("unreachable-included-origin-state.json");
+    let mut daemon = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut daemon,
+    )
+    .await;
+    assert_success(&resp);
+
+    let targets_before = {
+        let manager = daemon.browser.as_ref().unwrap();
+        page_target_ids(&manager.client).await
+    };
+
+    for attempt in 0..5 {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_command(
+                &json!({
+                    "id": format!("save-{attempt}"),
+                    "action": "state_save",
+                    "path": state_path.to_str().unwrap(),
+                    "includeOrigins": ["https://state-save-unreachable.invalid"]
+                }),
+                &mut daemon,
+            ),
+        )
+        .await
+        .expect("state save should not wait on its already-closed temporary target");
+        assert_success(&response);
+    }
+    assert!(state_path.exists());
+
+    let targets_after = {
+        let manager = daemon.browser.as_ref().unwrap();
+        page_target_ids(&manager.client).await
+    };
+    assert_eq!(
+        targets_after, targets_before,
+        "state save should close its temporary target"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut daemon).await;
+    assert_success(&resp);
+}
+
+async fn page_target_ids(
+    client: &super::cdp::client::CdpClient,
+) -> std::collections::HashSet<String> {
+    client
+        .send_command("Target.getTargets", Some(json!({})), None)
+        .await
+        .unwrap()["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|target| target["type"] == "page")
+        .filter_map(|target| target["targetId"].as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_state_round_trips_partitioned_cookie_metadata() {
     let output = tempfile::tempdir().unwrap();
     let state_path = output.path().join("partitioned-cookie-state.json");

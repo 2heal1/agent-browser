@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -36,6 +38,24 @@ pub struct OriginStorage {
 pub struct StorageEntry {
     pub name: String,
     pub value: String,
+}
+
+const STATE_CDP_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+const STATE_TARGET_CLEANUP_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+const STATE_ORIGIN_COLLECTION_BASE_TIMEOUT: Duration = Duration::from_secs(10);
+const STATE_ORIGIN_COLLECTION_TIMEOUT_PER_ORIGIN: Duration = Duration::from_secs(7);
+const STATE_ORIGIN_COLLECTION_MAX_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct OriginStorageCollection {
+    origins: Vec<OriginStorage>,
+    failures: Vec<OriginStorageFailure>,
+}
+
+#[derive(Debug)]
+struct OriginStorageFailure {
+    origin: String,
+    error: String,
 }
 
 fn collect_frame_origins(tree: &Value, origins: &mut HashSet<String>) {
@@ -113,9 +133,10 @@ async fn eval_origin_storage(
     client: &CdpClient,
     session_id: &str,
     origin_js: &str,
-) -> Option<OriginStorage> {
-    let result = client
-        .send_command_typed::<_, super::cdp::types::EvaluateResult>(
+) -> Result<Option<OriginStorage>, String> {
+    let result = state_cdp_stage(
+        "Runtime.evaluate storage",
+        client.send_command_typed::<_, super::cdp::types::EvaluateResult>(
             "Runtime.evaluate",
             &EvaluateParams {
                 expression: origin_js.to_string(),
@@ -123,11 +144,11 @@ async fn eval_origin_storage(
                 await_promise: Some(false),
             },
             Some(session_id),
-        )
-        .await
-        .ok()?;
+        ),
+    )
+    .await?;
     let data = result.result.value.unwrap_or(Value::Null);
-    parse_origin_storage(&data)
+    Ok(parse_origin_storage(&data))
 }
 
 /// Create a temporary CDP target, navigate it to each origin to collect localStorage,
@@ -137,47 +158,78 @@ async fn collect_storage_via_temp_target(
     client: &CdpClient,
     origins: &[String],
     origin_js: &str,
-) -> Result<Vec<OriginStorage>, String> {
+) -> Result<OriginStorageCollection, String> {
+    // Subscribe before creating the target so cleanup can wait until Chrome's
+    // Target.targetDestroyed event is visible to every daemon subscriber.
+    // Otherwise the command's post-action event drain can race the event and
+    // try to prepare the already-closed target as a user tab.
+    let mut target_event_rx = client.subscribe();
+
     // Prefer a background target so headed sessions do not visibly switch
     // away from the user's page while cross-origin storage is collected.
     // Older CDP implementations may reject the experimental `background`
     // field, so retry with the broadly supported request shape.
-    let create_result: CreateTargetResult = match client
-        .send_command_typed(
+    let create_result: CreateTargetResult = match state_cdp_stage(
+        "Target.createTarget background",
+        client.send_command_typed(
             "Target.createTarget",
             &json!({ "url": "about:blank", "background": true }),
             None,
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => {
-            client
-                .send_command_typed(
+            state_cdp_stage(
+                "Target.createTarget fallback",
+                client.send_command_typed(
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
                     },
                     None,
-                )
-                .await?
+                ),
+            )
+            .await?
         }
     };
 
     let target_id = create_result.target_id;
 
-    // Ensure the target is closed even if attach or later steps fail
-    let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
+    let collection_timeout = origin_collection_timeout(origins.len());
+    let result = match tokio::time::timeout(
+        collection_timeout,
+        collect_storage_in_target(client, &target_id, origins, origin_js),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Cross-origin storage collection timed out after {}ms",
+            collection_timeout.as_millis()
+        )),
+    };
 
-    let _ = client
-        .send_command_typed::<_, Value>(
+    let cleanup = state_cdp_stage(
+        "Target.closeTarget",
+        client.send_command_typed::<_, Value>(
             "Target.closeTarget",
-            &CloseTargetParams { target_id },
+            &CloseTargetParams {
+                target_id: target_id.clone(),
+            },
             None,
-        )
-        .await;
+        ),
+    )
+    .await;
+    let cleanup = match cleanup {
+        Ok(value) => wait_for_target_destroyed(&mut target_event_rx, &target_id)
+            .await
+            .map(|_| value),
+        Err(error) => Err(error),
+    };
 
-    result
+    combine_with_cleanup(result, cleanup, "temporary storage target")
 }
 
 async fn collect_storage_in_target(
@@ -185,48 +237,41 @@ async fn collect_storage_in_target(
     target_id: &str,
     origins: &[String],
     origin_js: &str,
-) -> Result<Vec<OriginStorage>, String> {
-    let attach_result: AttachToTargetResult = client
-        .send_command_typed(
+) -> Result<OriginStorageCollection, String> {
+    let attach_result: AttachToTargetResult = state_cdp_stage(
+        "Target.attachToTarget",
+        client.send_command_typed(
             "Target.attachToTarget",
             &AttachToTargetParams {
                 target_id: target_id.to_string(),
                 flatten: true,
             },
             None,
-        )
-        .await?;
+        ),
+    )
+    .await?;
 
     let temp_session = &attach_result.session_id;
 
-    client
-        .send_command_no_params("Page.enable", Some(temp_session))
-        .await?;
-    client
-        .send_command_no_params("Runtime.enable", Some(temp_session))
-        .await?;
-    client
-        .send_command_no_params("Network.enable", Some(temp_session))
-        .await?;
-    client
-        .send_command(
-            "Network.setRequestInterception",
-            Some(json!({
-                "patterns": [{
-                    "urlPattern": "*",
-                    "interceptionStage": "Request"
-                }]
-            })),
-            Some(temp_session),
-        )
-        .await?;
+    state_cdp_stage(
+        "Page.enable",
+        client.send_command_no_params("Page.enable", Some(temp_session)),
+    )
+    .await?;
+    state_cdp_stage(
+        "Runtime.enable",
+        client.send_command_no_params("Runtime.enable", Some(temp_session)),
+    )
+    .await?;
+    enable_document_interception(client, temp_session).await?;
 
     let blank_response_b64 = blank_html_response_b64();
     let mut event_rx = client.subscribe();
     let mut results = Vec::new();
+    let mut failures = Vec::new();
 
     for target_origin in origins {
-        if navigate_to_intercepted_origin(
+        if let Err(error) = navigate_to_intercepted_origin(
             client,
             temp_session,
             &mut event_rx,
@@ -234,19 +279,32 @@ async fn collect_storage_in_target(
             &blank_response_b64,
         )
         .await
-        .is_err()
         {
+            failures.push(OriginStorageFailure {
+                origin: target_origin.clone(),
+                error,
+            });
             continue;
         }
 
-        if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
-            if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
+        match eval_origin_storage(client, temp_session, origin_js).await {
+            Ok(Some(storage))
+                if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() =>
+            {
                 results.push(storage);
             }
+            Ok(_) => {}
+            Err(error) => failures.push(OriginStorageFailure {
+                origin: target_origin.clone(),
+                error,
+            }),
         }
     }
 
-    Ok(results)
+    Ok(OriginStorageCollection {
+        origins: results,
+        failures,
+    })
 }
 
 async fn navigate_to_intercepted_origin(
@@ -273,16 +331,18 @@ async fn navigate_to_intercepted_origin(
                     if let Some(interception_id) =
                         evt.params.get("interceptionId").and_then(|v| v.as_str())
                     {
-                        client
-                            .send_command(
+                        state_cdp_stage(
+                            "Network.continueInterceptedRequest",
+                            client.send_command(
                                 "Network.continueInterceptedRequest",
                                 Some(json!({
                                     "interceptionId": interception_id,
                                     "rawResponse": blank_response_b64
                                 })),
                                 Some(session_id),
-                            )
-                            .await?;
+                            ),
+                        )
+                        .await?;
                     }
                 } else if evt.method == "Page.loadEventFired" {
                     return Ok(());
@@ -304,11 +364,110 @@ fn blank_html_response_b64() -> String {
     // Keep Chrome from requesting /favicon.ico after the intercepted document loads.
     let body = r#"<html><head><link rel="icon" href="data:,"></head></html>"#;
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body,
     );
     base64::engine::general_purpose::STANDARD.encode(response)
+}
+
+async fn enable_document_interception(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    state_cdp_stage(
+        "Network.enable",
+        client.send_command_no_params("Network.enable", Some(session_id)),
+    )
+    .await?;
+    state_cdp_stage(
+        "Network.setRequestInterception",
+        client.send_command(
+            "Network.setRequestInterception",
+            Some(json!({
+                "patterns": [{
+                    "urlPattern": "*",
+                    "interceptionStage": "Request"
+                }]
+            })),
+            Some(session_id),
+        ),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn state_cdp_stage<T, F>(stage: &str, future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(STATE_CDP_STAGE_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(format!("{} failed: {}", stage, error)),
+        Err(_) => Err(format!(
+            "{} timed out after {}ms",
+            stage,
+            STATE_CDP_STAGE_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+fn origin_collection_timeout(origin_count: usize) -> Duration {
+    let per_origin = STATE_ORIGIN_COLLECTION_TIMEOUT_PER_ORIGIN
+        .checked_mul(u32::try_from(origin_count).unwrap_or(u32::MAX))
+        .unwrap_or(STATE_ORIGIN_COLLECTION_MAX_TIMEOUT);
+    std::cmp::min(
+        STATE_ORIGIN_COLLECTION_BASE_TIMEOUT.saturating_add(per_origin),
+        STATE_ORIGIN_COLLECTION_MAX_TIMEOUT,
+    )
+}
+
+fn combine_with_cleanup<T, U>(
+    result: Result<T, String>,
+    cleanup: Result<U, String>,
+    resource: &str,
+) -> Result<T, String> {
+    match (result, cleanup) {
+        (Ok(value), Ok(_)) => Ok(value),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(format!(
+            "Failed to clean up {}: {}",
+            resource, cleanup_error
+        )),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{}; cleanup of {} also failed: {}",
+            error, resource, cleanup_error
+        )),
+    }
+}
+
+async fn wait_for_target_destroyed(
+    event_rx: &mut tokio::sync::broadcast::Receiver<CdpEvent>,
+    target_id: &str,
+) -> Result<(), String> {
+    let result = tokio::time::timeout(STATE_TARGET_CLEANUP_EVENT_TIMEOUT, async {
+        loop {
+            match event_rx.recv().await {
+                Ok(event)
+                    if event.method == "Target.targetDestroyed"
+                        && event.params.get("targetId").and_then(Value::as_str)
+                            == Some(target_id) =>
+                {
+                    return Ok(());
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err("CDP event stream closed before target cleanup".to_string());
+                }
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Target.targetDestroyed timed out after {}ms",
+            STATE_TARGET_CLEANUP_EVENT_TIMEOUT.as_millis()
+        )),
+    }
 }
 
 async fn restore_local_storage_via_temp_target(
@@ -322,6 +481,7 @@ async fn restore_local_storage_via_temp_target(
         return Ok(());
     }
 
+    let mut target_event_rx = client.subscribe();
     let create_result: CreateTargetResult = client
         .send_command_typed(
             "Target.createTarget",
@@ -334,13 +494,18 @@ async fn restore_local_storage_via_temp_target(
     let target_id = create_result.target_id;
     let result = restore_storage_in_target(client, &target_id, origins).await;
 
-    let _ = client
+    let close_result = client
         .send_command_typed::<_, Value>(
             "Target.closeTarget",
-            &CloseTargetParams { target_id },
+            &CloseTargetParams {
+                target_id: target_id.clone(),
+            },
             None,
         )
         .await;
+    if close_result.is_ok() {
+        let _ = wait_for_target_destroyed(&mut target_event_rx, &target_id).await;
+    }
 
     result
 }
@@ -515,7 +680,11 @@ pub async fn save_state(
     visited_origins: &HashSet<String>,
     included_origins: &[String],
 ) -> Result<String, String> {
-    let cookies = cookies::get_all_cookies(client, session_id).await?;
+    let cookies = state_cdp_stage(
+        "Network.getAllCookies",
+        cookies::get_all_cookies(client, session_id),
+    )
+    .await?;
 
     let origin_js = r#"(() => {
         const result = { origin: location.origin, localStorage: [], sessionStorage: [] };
@@ -535,13 +704,17 @@ pub async fn save_state(
     })()"#;
 
     // Merge visited origins with current frame tree origins
-    let mut all_origins = visited_origins.clone();
+    let mut explicitly_included_origins = HashSet::new();
     for included_origin in included_origins {
-        all_origins.insert(normalize_included_origin(included_origin)?);
+        explicitly_included_origins.insert(normalize_included_origin(included_origin)?);
     }
-    if let Ok(tree_result) = client
-        .send_command_no_params("Page.getFrameTree", Some(session_id))
-        .await
+    let mut all_origins = visited_origins.clone();
+    all_origins.extend(explicitly_included_origins.iter().cloned());
+    if let Ok(tree_result) = state_cdp_stage(
+        "Page.getFrameTree",
+        client.send_command_no_params("Page.getFrameTree", Some(session_id)),
+    )
+    .await
     {
         if let Some(tree) = tree_result.get("frameTree") {
             collect_frame_origins(tree, &mut all_origins);
@@ -552,7 +725,7 @@ pub async fn save_state(
     let mut origins = Vec::new();
     let mut current_origin = String::new();
 
-    if let Some(storage) = eval_origin_storage(client, session_id, origin_js).await {
+    if let Some(storage) = eval_origin_storage(client, session_id, origin_js).await? {
         current_origin = storage.origin.clone();
         if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
             origins.push(storage);
@@ -563,11 +736,9 @@ pub async fn save_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(temp_origins) =
-            collect_storage_via_temp_target(client, &remaining, origin_js).await
-        {
-            origins.extend(temp_origins);
-        }
+        let collection = collect_storage_via_temp_target(client, &remaining, origin_js).await?;
+        validate_explicit_origin_failures(&collection.failures, &explicitly_included_origins)?;
+        origins.extend(collection.origins);
     }
 
     let state = StorageState { cookies, origins };
@@ -600,6 +771,22 @@ pub async fn save_state(
     }
 
     Ok(save_path)
+}
+
+fn validate_explicit_origin_failures(
+    failures: &[OriginStorageFailure],
+    explicitly_included_origins: &HashSet<String>,
+) -> Result<(), String> {
+    if let Some(failure) = failures
+        .iter()
+        .find(|failure| explicitly_included_origins.contains(&failure.origin))
+    {
+        return Err(format!(
+            "Failed to collect explicitly included storage origin {}: {}",
+            failure.origin, failure.error
+        ));
+    }
+    Ok(())
 }
 
 pub async fn save_auto_state_transactional(
@@ -1273,6 +1460,36 @@ mod tests {
         );
         assert!(normalize_included_origin("file:///tmp/auth.html").is_err());
         assert!(normalize_included_origin("sso.example.com").is_err());
+    }
+
+    #[test]
+    fn test_origin_collection_timeout_is_bounded() {
+        assert_eq!(origin_collection_timeout(0), Duration::from_secs(10));
+        assert_eq!(origin_collection_timeout(1), Duration::from_secs(17));
+        assert_eq!(origin_collection_timeout(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_explicit_origin_failure_is_not_silently_ignored() {
+        let failures = vec![OriginStorageFailure {
+            origin: "https://sso.example.com".to_string(),
+            error: "Runtime.evaluate timed out".to_string(),
+        }];
+        let explicit = HashSet::from(["https://sso.example.com".to_string()]);
+
+        let error = validate_explicit_origin_failures(&failures, &explicit).unwrap_err();
+        assert!(error.contains("https://sso.example.com"));
+        assert!(error.contains("Runtime.evaluate timed out"));
+    }
+
+    #[test]
+    fn test_discovered_origin_failure_remains_best_effort() {
+        let failures = vec![OriginStorageFailure {
+            origin: "https://frame.example.com".to_string(),
+            error: "Page navigation failed".to_string(),
+        }];
+
+        assert!(validate_explicit_origin_failures(&failures, &HashSet::new()).is_ok());
     }
 
     #[test]

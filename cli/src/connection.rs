@@ -995,12 +995,12 @@ fn connect(session: &str) -> Result<Connection, String> {
 
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
     // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
-    const MAX_RETRIES: u32 = 5;
     const RETRY_DELAY_MS: u64 = 200;
+    let max_attempts = command_attempt_limit(&cmd);
 
     let mut last_error = String::new();
 
-    for attempt in 0..MAX_RETRIES {
+    for attempt in 0..max_attempts {
         if attempt > 0 {
             thread::sleep(Duration::from_millis(RETRY_DELAY_MS * (attempt as u64)));
         }
@@ -1018,10 +1018,29 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         }
     }
 
+    if max_attempts == 1 {
+        return Err(last_error);
+    }
+
     Err(format!(
         "{} (after {} retries - daemon may be busy or unresponsive)",
-        last_error, MAX_RETRIES
+        last_error, max_attempts
     ))
+}
+
+fn command_attempt_limit(cmd: &Value) -> u32 {
+    // A timed-out state save can still be running in the daemon. Re-sending it
+    // queues duplicate cross-origin collection and file writes behind the
+    // original request, which extends the outage and can publish stale work.
+    if command_action(cmd) == Some("state_save") {
+        1
+    } else {
+        5
+    }
+}
+
+fn command_action(cmd: &Value) -> Option<&str> {
+    cmd.get("action").and_then(Value::as_str)
 }
 
 /// Check if an error is transient and worth retrying against the SAME daemon.
@@ -1078,8 +1097,15 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// the extended budget, and that field is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
 fn read_timeout_for(cmd: &Value) -> Duration {
+    const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+    const STATE_SAVE_RESPONSE_TIMEOUT_MS: u64 = 90_000;
     let op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
-    Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
+    let response_floor_ms = if command_action(cmd) == Some("state_save") {
+        STATE_SAVE_RESPONSE_TIMEOUT_MS
+    } else {
+        DEFAULT_RESPONSE_TIMEOUT_MS
+    };
+    Duration::from_millis(op_ms.saturating_add(10_000).max(response_floor_ms))
 }
 
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
@@ -1404,6 +1430,29 @@ mod tests {
     }
 
     // === Transient Error Detection Tests ===
+
+    #[test]
+    fn test_state_save_uses_one_delivery_attempt() {
+        let cmd = json!({ "action": "state_save", "path": "/tmp/state.json" });
+        assert_eq!(command_attempt_limit(&cmd), 1);
+        assert_eq!(command_attempt_limit(&json!({ "action": "url" })), 5);
+    }
+
+    #[test]
+    fn test_state_save_response_budget_exceeds_cdp_collection_budget() {
+        let cmd = json!({ "action": "state_save", "path": "/tmp/state.json" });
+        assert_eq!(read_timeout_for(&cmd), Duration::from_secs(90));
+        assert_eq!(
+            read_timeout_for(&json!({ "action": "url" })),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn test_explicit_operation_timeout_can_extend_state_save_budget() {
+        let cmd = json!({ "action": "state_save", "timeout": 120_000 });
+        assert_eq!(read_timeout_for(&cmd), Duration::from_secs(130));
+    }
 
     #[test]
     fn test_is_transient_error_eagain_macos() {

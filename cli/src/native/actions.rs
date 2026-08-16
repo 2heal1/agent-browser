@@ -238,6 +238,40 @@ struct DrainedEvents {
     har_finished_requests: Vec<(String, Option<String>)>,
 }
 
+impl DrainedEvents {
+    /// Drop setup work for targets and sessions that were already closed in
+    /// the same drained event batch. Short-lived internal targets (for
+    /// example, state-save storage collectors) can be created, attached, and
+    /// destroyed before the daemon's next event drain. Trying to prepare or
+    /// attach those stale entries can block a user command on a dead CDP
+    /// session until the transport timeout expires.
+    fn discard_closed_target_events(&mut self) {
+        let destroyed_targets: HashSet<String> = self.destroyed_targets.iter().cloned().collect();
+        let detached_sessions: HashSet<String> =
+            self.detached_iframe_sessions.iter().cloned().collect();
+
+        self.new_targets
+            .retain(|event| !destroyed_targets.contains(&event.target_info.target_id));
+        self.changed_targets
+            .retain(|event| !destroyed_targets.contains(&event.target_info.target_id));
+        self.attached_page_sessions.retain(|(target, session_id)| {
+            !destroyed_targets.contains(&target.target_id)
+                && !detached_sessions.contains(session_id)
+        });
+        self.attached_iframe_sessions
+            .retain(|(target_id, session_id)| {
+                !destroyed_targets.contains(target_id) && !detached_sessions.contains(session_id)
+            });
+        self.attached_worker_sessions
+            .retain(|(target, session_id)| {
+                !destroyed_targets.contains(&target.target_id)
+                    && !detached_sessions.contains(session_id)
+            });
+        self.attached_other_sessions
+            .retain(|session_id| !detached_sessions.contains(session_id));
+    }
+}
+
 fn is_active_iframe_network_event(
     method: &str,
     session_id: Option<&str>,
@@ -1829,7 +1863,7 @@ impl DaemonState {
             new_targets.retain(|te| !attached_page_target_ids.contains(&te.target_info.target_id));
         }
 
-        DrainedEvents {
+        let mut drained = DrainedEvents {
             pending_acks,
             new_targets,
             changed_targets,
@@ -1840,7 +1874,9 @@ impl DaemonState {
             attached_other_sessions,
             detached_iframe_sessions,
             har_finished_requests,
-        }
+        };
+        drained.discard_closed_target_events();
+        drained
     }
 }
 
@@ -12575,6 +12611,63 @@ mod tests {
             .attached_iframe_sessions
             .push(("frame".to_string(), "session".to_string()));
         assert!(active_frame_scope_may_have_changed(&attached_iframe));
+    }
+
+    #[test]
+    fn test_drained_events_discard_targets_closed_in_same_batch() {
+        fn target(target_id: &str) -> TargetInfo {
+            TargetInfo {
+                target_id: target_id.to_string(),
+                target_type: "page".to_string(),
+                title: String::new(),
+                url: "about:blank".to_string(),
+                attached: Some(true),
+                browser_context_id: None,
+            }
+        }
+
+        let mut drained = DrainedEvents {
+            new_targets: vec![
+                TargetCreatedEvent {
+                    target_info: target("closed-target"),
+                },
+                TargetCreatedEvent {
+                    target_info: target("live-target"),
+                },
+            ],
+            changed_targets: vec![TargetInfoChangedEvent {
+                target_info: target("closed-target"),
+            }],
+            destroyed_targets: vec!["closed-target".to_string()],
+            attached_page_sessions: vec![
+                (target("closed-target"), "closed-session".to_string()),
+                (target("live-target"), "live-session".to_string()),
+                (target("detached-target"), "detached-session".to_string()),
+            ],
+            attached_worker_sessions: vec![
+                (target("closed-target"), "closed-worker".to_string()),
+                (target("live-worker"), "live-worker-session".to_string()),
+            ],
+            attached_other_sessions: vec![
+                "detached-session".to_string(),
+                "live-other-session".to_string(),
+            ],
+            detached_iframe_sessions: vec!["detached-session".to_string()],
+            ..DrainedEvents::default()
+        };
+
+        drained.discard_closed_target_events();
+
+        assert_eq!(drained.new_targets.len(), 1);
+        assert_eq!(drained.new_targets[0].target_info.target_id, "live-target");
+        assert!(drained.changed_targets.is_empty());
+        assert_eq!(drained.attached_page_sessions.len(), 1);
+        assert_eq!(drained.attached_page_sessions[0].0.target_id, "live-target");
+        assert_eq!(drained.attached_worker_sessions.len(), 1);
+        assert_eq!(
+            drained.attached_other_sessions,
+            vec!["live-other-session".to_string()]
+        );
     }
 
     #[test]
