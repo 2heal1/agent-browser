@@ -1,6 +1,6 @@
 {
   "name": "@divebell/agent-browser",
-  "version": "0.34.0-divebell.1",
+  "version": "0.34.0-divebell.2",
   "description": "Browser automation CLI for AI agents with Divebell memory diagnostics",
   "type": "module",
   "packageManager": "pnpm@11.1.3",
