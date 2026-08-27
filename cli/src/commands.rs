@@ -149,6 +149,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "profiler"
             | "memory"
             | "coverage"
+            | "webmcp"
             | "debug"
             | "record"
             | "console"
@@ -1693,6 +1694,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === JavaScript code coverage (Chrome only) ===
         "coverage" => parse_coverage(&rest, &id),
 
+        // === Page-exposed WebMCP tools (Chrome CDP only) ===
+        "webmcp" => parse_webmcp(&rest, &id),
+
         // === Compiled JavaScript debugging (Chrome only) ===
         "debug" => parse_debug(&rest, &id),
 
@@ -2329,6 +2333,89 @@ fn parse_coverage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         None => Err(ParseError::MissingArguments {
             context: "coverage".to_string(),
             usage: COVERAGE_USAGE,
+        }),
+    }
+}
+
+fn parse_webmcp(rest: &[&str], id: &str) -> Result<Value, ParseError> {
+    const WEBMCP_USAGE: &str =
+        "webmcp <list|call> [tool-name] [--input <json>] [--frame-id <id>] [--timeout <ms>]";
+    match rest.first().copied() {
+        Some("list") => {
+            if rest.len() != 1 {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown webmcp list option: {}", rest[1]),
+                    usage: "webmcp list",
+                });
+            }
+            Ok(json!({ "id": id, "action": "webmcp_list" }))
+        }
+        Some("call") => {
+            let tool_name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "webmcp call".to_string(),
+                usage:
+                    "webmcp call <tool-name> [--input <json>] [--frame-id <id>] [--timeout <ms>]",
+            })?;
+            if tool_name.starts_with("--") {
+                return Err(ParseError::MissingArguments {
+                    context: "webmcp call".to_string(),
+                    usage: "webmcp call <tool-name> [--input <json>] [--frame-id <id>] [--timeout <ms>]",
+                });
+            }
+            let mut command = json!({
+                "id": id,
+                "action": "webmcp_call",
+                "toolName": tool_name,
+                "input": {},
+            });
+            let mut index = 2;
+            while index < rest.len() {
+                let flag = rest[index];
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("webmcp call {}", flag),
+                        usage: WEBMCP_USAGE,
+                    })?;
+                match flag {
+                    "--input" => {
+                        let input = serde_json::from_str::<Value>(value).map_err(|error| {
+                            ParseError::InvalidValue {
+                                message: format!("Invalid WebMCP input JSON: {}", error),
+                                usage: WEBMCP_USAGE,
+                            }
+                        })?;
+                        if !input.is_object() {
+                            return Err(ParseError::InvalidValue {
+                                message: "WebMCP input must be a JSON object".to_string(),
+                                usage: WEBMCP_USAGE,
+                            });
+                        }
+                        command["input"] = input;
+                    }
+                    "--frame-id" => command["frameId"] = json!(value),
+                    "--timeout" => {
+                        command["timeout"] =
+                            json!(parse_positive_u64(value, "--timeout", WEBMCP_USAGE)?);
+                    }
+                    option => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown webmcp call option: {}", option),
+                            usage: WEBMCP_USAGE,
+                        });
+                    }
+                }
+                index += 2;
+            }
+            Ok(command)
+        }
+        Some(subcommand) => Err(ParseError::UnknownSubcommand {
+            subcommand: subcommand.to_string(),
+            valid_options: &["list", "call"],
+        }),
+        None => Err(ParseError::MissingArguments {
+            context: "webmcp".to_string(),
+            usage: WEBMCP_USAGE,
         }),
     }
 }
@@ -5707,6 +5794,40 @@ mod tests {
 
         let unknown = parse_command(&args("coverage start --detailed"), &default_flags());
         assert!(matches!(unknown, Err(ParseError::InvalidValue { .. })));
+    }
+
+    // === WebMCP Tests ===
+
+    #[test]
+    fn test_webmcp_list() {
+        let command = parse_command(&args("webmcp list"), &default_flags()).unwrap();
+        assert_eq!(command["action"], "webmcp_list");
+    }
+
+    #[test]
+    fn test_webmcp_call_with_options() {
+        let command = parse_command(
+            &args(
+                r#"webmcp call searchProducts --input {"query":"Widget"} --frame-id frame-a --timeout 42000"#,
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(command["action"], "webmcp_call");
+        assert_eq!(command["toolName"], "searchProducts");
+        assert_eq!(command["input"]["query"], "Widget");
+        assert_eq!(command["frameId"], "frame-a");
+        assert_eq!(command["timeout"], 42000);
+    }
+
+    #[test]
+    fn test_webmcp_call_rejects_non_object_input() {
+        let error = parse_command(
+            &args(r#"webmcp call searchProducts --input ["Widget"]"#),
+            &default_flags(),
+        )
+        .unwrap_err();
+        assert!(error.format().contains("must be a JSON object"));
     }
 
     #[test]

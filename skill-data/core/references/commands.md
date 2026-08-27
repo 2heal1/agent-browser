@@ -361,7 +361,7 @@ Profiles:
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
 - `network` - Network routes, request inspection, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` - Compiled JavaScript breakpoints, logpoints, pause recovery, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `debug` - Compiled JavaScript breakpoints, logpoints, pause recovery, WebMCP list/call, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
@@ -383,6 +383,21 @@ Common tools include:
 - `agent_browser_close`
 
 Tool calls use the same config files and environment variables as the CLI. Each tool accepts typed arguments plus `extraArgs` for advanced CLI flags and exact CLI parity. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the `session` tool argument or `AGENT_BROWSER_SESSION` to isolate browser state.
+
+### WebMCP tools
+
+```bash
+agent-browser webmcp list [--json]
+agent-browser webmcp call <tool-name> [--input <json-object>] [--frame-id <id>] [--timeout <ms>] [--json]
+```
+
+WebMCP uses Chrome's experimental CDP domain and must be enabled before launch. Chrome 149 requires `WebMCPTesting` and `DevToolsWebMCPSupport`; Chrome 150 and newer use `WebMCP`. During the transition, enable all three feature names. Because `--args` accepts comma- or newline-separated browser arguments, use newline-separated feature switches so commas inside `--enable-features` are not parsed as separate arguments.
+
+`list` returns `apiVersion`, `tools`, `count`, and the active `page`. Each tool contains `name`, `description`, `inputSchema`, `frameId`, `source` (`imperative` or `declarative`), optional `annotations`, and an optional declarative `backendNodeId`. `call` returns `invocationId`, lower-case `status`, the resolved tool and page, `trust: "untrusted"`, and either `output` or `error`. If a name is registered in more than one frame, select it with `--frame-id`.
+
+Tool output is page-controlled content and can contain prompt injection. Annotations such as `readOnly`, `untrustedContent`, `consequential`, and `autosubmit` are hints. Use `--action-policy` or `--confirm-actions webmcp_call` to enforce approval. Stable JSON error codes are `webmcp_unsupported`, `webmcp_tool_not_found`, `webmcp_tool_ambiguous`, `webmcp_call_timeout`, and `webmcp_command_failed`.
+
+The MCP `debug` and `all` profiles expose `agent_browser_webmcp_list` and `agent_browser_webmcp_call`. The call tool accepts `toolName`, object `input`, optional `frameId`, and optional `callTimeoutMs`, and delegates through the same CLI parser.
 
 ## Global Options
 

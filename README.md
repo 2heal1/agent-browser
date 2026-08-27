@@ -404,6 +404,8 @@ agent-browser debug logpoint set <script-id> <line> --expression <js> # Add a lo
 agent-browser debug stack               # Inspect the current pause
 agent-browser debug resume              # Resume the current pause
 agent-browser debug events              # Read debugger and logpoint events
+agent-browser webmcp list --json        # List tools registered by the active page
+agent-browser webmcp call <name> --input '{}' # Call one registered page tool
 agent-browser console                 # View console messages (log, error, warn, info)
 agent-browser console --json          # JSON output with raw CDP args for programmatic access
 agent-browser console --clear         # Clear console
@@ -420,6 +422,21 @@ agent-browser state clear [name]      # Clear states for session
 agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
+
+### WebMCP tools
+
+Chrome pages can expose structured tools through the experimental WebMCP API. Launch Chrome with WebMCP enabled, then discover and call the active page's tools through CDP:
+
+```bash
+agent-browser --args $'--enable-features=WebMCP\n--enable-features=WebMCPTesting\n--enable-features=DevToolsWebMCPSupport' open https://example.com
+agent-browser webmcp list --json
+agent-browser webmcp call getProductCount --input '{}' --json
+agent-browser webmcp call searchProducts --input '{"query":"Widget"}' --timeout 5000 --json
+```
+
+Chrome 149 needs `WebMCPTesting` and `DevToolsWebMCPSupport`; Chrome 150 and newer use `WebMCP`. Supplying all three feature names supports both during the experiment. `list` returns normalized tool schemas, annotations, frame identifiers, and whether each tool is imperative or declarative. If duplicate names exist in different frames, pass `--frame-id` to `call`.
+
+Every call result includes `trust: "untrusted"`: WebMCP output is controlled by the page and can contain prompt injection. Treat annotations such as `readOnly` and `consequential` as hints, not enforcement. Use `--action-policy` or `--confirm-actions webmcp_call` when page tool execution requires approval. JSON failures include `webmcp_unsupported`, `webmcp_tool_not_found`, `webmcp_tool_ambiguous`, `webmcp_call_timeout`, or `webmcp_command_failed`.
 
 ### Compiled JavaScript debugger
 
@@ -640,7 +657,7 @@ Profiles:
 - `core` — Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
 - `network` — Network routes, request inspection, HAR, headers, credentials, offline
 - `state` — Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` — Compiled JavaScript breakpoints, logpoints, pause recovery, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `debug` — Compiled JavaScript breakpoints, logpoints, pause recovery, WebMCP list/call, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
 - `react` — React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
@@ -659,6 +676,8 @@ Common tools include:
 - `agent_browser_screenshot`
 - `agent_browser_get_url`
 - `agent_browser_eval`
+- `agent_browser_webmcp_list`
+- `agent_browser_webmcp_call`
 - `agent_browser_close`
 
 Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.

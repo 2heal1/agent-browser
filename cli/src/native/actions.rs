@@ -47,6 +47,7 @@ use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
 use super::webdriver::ios;
 use super::webdriver::safari;
+use super::webmcp;
 
 /// Wait strategy used by `auth_login` when navigating to the login page.
 ///
@@ -2757,6 +2758,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "coverage_take" => handle_coverage_take(cmd, state).await,
         "coverage_stop" => handle_coverage_stop(cmd, state).await,
         "coverage_cancel" => handle_coverage_cancel(state).await,
+        "webmcp_list" => handle_webmcp_list(state).await,
+        "webmcp_call" => handle_webmcp_call(cmd, state).await,
         "recording_start" => handle_recording_start(cmd, state).await,
         "recording_stop" => handle_recording_stop(state).await,
         "recording_restart" => handle_recording_restart(cmd, state).await,
@@ -2907,6 +2910,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 memory::with_api_version(data)
             } else if action.starts_with("coverage_") {
                 coverage::with_api_version(data)
+            } else if action.starts_with("webmcp_") {
+                webmcp::with_api_version(data)
             } else {
                 data
             },
@@ -2920,6 +2925,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             } else if action.starts_with("coverage_") {
                 if let Some(object) = response.as_object_mut() {
                     object.insert("errorCode".to_string(), json!(coverage::error_code(&e)));
+                }
+            } else if action.starts_with("webmcp_") {
+                if let Some(object) = response.as_object_mut() {
+                    object.insert("errorCode".to_string(), json!(webmcp::error_code(&e)));
                 }
             }
             response
@@ -7251,6 +7260,40 @@ async fn handle_coverage_cancel(state: &DaemonState) -> Result<Value, String> {
             "targetId": capture.target_id,
         }))
     }
+}
+
+fn ensure_webmcp_supported(state: &DaemonState) -> Result<(), String> {
+    if !matches!(state.backend_type, BackendType::Cdp) || state.engine != "chrome" {
+        return Err(webmcp::unsupported(format!(
+            "WebMCP is only supported with the Chrome CDP engine; current engine is {}",
+            state.engine
+        )));
+    }
+    Ok(())
+}
+
+async fn handle_webmcp_list(state: &DaemonState) -> Result<Value, String> {
+    ensure_webmcp_supported(state)?;
+    let manager = state.browser.as_ref().ok_or("Browser not launched")?;
+    webmcp::list(manager).await
+}
+
+async fn handle_webmcp_call(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    ensure_webmcp_supported(state)?;
+    let manager = state.browser.as_ref().ok_or("Browser not launched")?;
+    let tool_name = cmd
+        .get("toolName")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'toolName' parameter")?;
+    let input = cmd.get("input").cloned().unwrap_or_else(|| json!({}));
+    webmcp::call(
+        manager,
+        tool_name,
+        input,
+        cmd.get("frameId").and_then(Value::as_str),
+        cmd.get("timeout").and_then(Value::as_u64),
+    )
+    .await
 }
 
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

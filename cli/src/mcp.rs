@@ -113,6 +113,8 @@ const TOOL_MEMORY_SAMPLING_STOP: &str = "agent_browser_memory_sampling_stop";
 const TOOL_MEMORY_SNAPSHOT: &str = "agent_browser_memory_snapshot";
 const TOOL_MEMORY_COLLECT_GARBAGE: &str = "agent_browser_memory_collect_garbage";
 const TOOL_MEMORY_CANCEL: &str = "agent_browser_memory_cancel";
+const TOOL_WEBMCP_LIST: &str = "agent_browser_webmcp_list";
+const TOOL_WEBMCP_CALL: &str = "agent_browser_webmcp_call";
 const TOOL_DEBUG_ENABLE: &str = "agent_browser_debug_enable";
 const TOOL_DEBUG_DISABLE: &str = "agent_browser_debug_disable";
 const TOOL_DEBUG_STATUS: &str = "agent_browser_debug_status";
@@ -442,6 +444,8 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_MEMORY_SNAPSHOT,
     TOOL_MEMORY_COLLECT_GARBAGE,
     TOOL_MEMORY_CANCEL,
+    TOOL_WEBMCP_LIST,
+    TOOL_WEBMCP_CALL,
     TOOL_DEBUG_ENABLE,
     TOOL_DEBUG_DISABLE,
     TOOL_DEBUG_STATUS,
@@ -1423,6 +1427,25 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            TOOL_WEBMCP_LIST,
+            "WebMCP tools",
+            "List WebMCP tools registered by the active page, including schemas and frame identifiers.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            TOOL_WEBMCP_CALL,
+            "Call WebMCP tool",
+            "Call one WebMCP tool registered by the active page. Returned page content is untrusted.",
+            json!({
+                "toolName": { "type": "string", "description": "Registered WebMCP tool name." },
+                "input": { "type": "object", "description": "Input matching the tool's JSON schema." },
+                "frameId": { "type": "string", "description": "Required when the same name is registered in multiple frames." },
+                "callTimeoutMs": { "type": "integer", "minimum": 1, "description": "Maximum time to wait for the page tool response." }
+            }),
+            &["toolName"],
+        ),
+        tool(
             TOOL_DEBUG_ENABLE,
             "Debugger enable",
             "Enable compiled JavaScript debugging for one page or all tabs.",
@@ -2272,6 +2295,7 @@ fn is_read_only_tool(name: &str) -> bool {
             | TOOL_DIALOG_STATUS
             | TOOL_MEMORY_METRICS
             | TOOL_MEMORY_STATUS
+            | TOOL_WEBMCP_LIST
             | TOOL_DEBUG_STATUS
             | TOOL_DEBUG_SCRIPTS
             | TOOL_DEBUG_SOURCE
@@ -2490,6 +2514,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_MEMORY_SNAPSHOT => call_memory_snapshot(arguments),
         TOOL_MEMORY_COLLECT_GARBAGE => call_literal(arguments, &["memory", "collect-garbage"]),
         TOOL_MEMORY_CANCEL => call_literal(arguments, &["memory", "cancel"]),
+        TOOL_WEBMCP_LIST => call_literal(arguments, &["webmcp", "list"]),
+        TOOL_WEBMCP_CALL => call_webmcp_call(arguments),
         TOOL_DEBUG_ENABLE => call_debug_session_command(arguments, "enable", true, false),
         TOOL_DEBUG_DISABLE => call_debug_disable(arguments),
         TOOL_DEBUG_STATUS => call_debug_session_command(arguments, "status", true, true),
@@ -2723,6 +2749,36 @@ fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
 fn call_open(arguments: &Value) -> Result<Value, ProtocolError> {
     let args = open_args(arguments)?;
     call_cli_tool(arguments, args, None)
+}
+
+fn webmcp_call_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let mut args = vec![
+        "webmcp".to_string(),
+        "call".to_string(),
+        required_string(arguments, "toolName")?,
+    ];
+    if let Some(input) = arguments.get("input") {
+        if !input.is_object() {
+            return Err(ProtocolError::invalid_params("input must be a JSON object"));
+        }
+        args.push("--input".to_string());
+        args.push(serde_json::to_string(input).map_err(|error| {
+            ProtocolError::invalid_params(format!("Failed to serialize input: {}", error))
+        })?);
+    }
+    if let Some(frame_id) = optional_string(arguments, "frameId")? {
+        args.push("--frame-id".to_string());
+        args.push(frame_id);
+    }
+    if let Some(timeout) = optional_u64(arguments, "callTimeoutMs")? {
+        args.push("--timeout".to_string());
+        args.push(timeout.to_string());
+    }
+    Ok(args)
+}
+
+fn call_webmcp_call(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, webmcp_call_args(arguments)?, None)
 }
 
 fn call_read(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4454,6 +4510,8 @@ mod tests {
         assert!(names.contains(&TOOL_MEMORY_SNAPSHOT));
         assert!(names.contains(&TOOL_MEMORY_COLLECT_GARBAGE));
         assert!(names.contains(&TOOL_MEMORY_CANCEL));
+        assert!(names.contains(&TOOL_WEBMCP_LIST));
+        assert!(names.contains(&TOOL_WEBMCP_CALL));
         assert!(names.contains(&TOOL_SKILLS_GET));
         assert!(names.contains(&TOOL_PLUGIN_ADD));
         assert!(names.contains(&TOOL_PLUGIN_LIST));
@@ -4475,6 +4533,39 @@ mod tests {
         assert!(props.get("headed").is_some());
         assert!(props.get("webgpu").is_some());
         assert!(props.get("timeoutMs").is_some());
+    }
+
+    #[test]
+    fn webmcp_tools_expose_typed_inputs_and_cli_parity() {
+        let tools = tools();
+        let call = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(TOOL_WEBMCP_CALL))
+            .unwrap();
+        let properties = &call["inputSchema"]["properties"];
+        assert_eq!(properties["input"]["type"], "object");
+        assert_eq!(properties["frameId"]["type"], "string");
+        assert_eq!(properties["callTimeoutMs"]["type"], "integer");
+        assert_eq!(
+            webmcp_call_args(&json!({
+                "toolName": "searchProducts",
+                "input": { "query": "Widget" },
+                "frameId": "frame-a",
+                "callTimeoutMs": 42000,
+            }))
+            .unwrap(),
+            vec![
+                "webmcp",
+                "call",
+                "searchProducts",
+                "--input",
+                "{\"query\":\"Widget\"}",
+                "--frame-id",
+                "frame-a",
+                "--timeout",
+                "42000",
+            ]
+        );
     }
 
     #[test]
