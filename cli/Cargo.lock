@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-browser"
-version = "0.34.0-divebell.2"
+version = "0.34.0-divebell.3"
 dependencies = [
  "aes-gcm",
  "async-trait",
