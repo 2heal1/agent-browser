@@ -121,6 +121,8 @@ pub const WEBDRIVER_UNSUPPORTED_ACTIONS: &[&str] = &[
     "trace_stop",
     "profiler_start",
     "profiler_stop",
+    "webmcp_list",
+    "webmcp_call",
     "route",
     "unroute",
     "expose",
@@ -140,6 +142,7 @@ mod tests {
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"a11y"));
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"screencast_start"));
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"trace_start"));
+        assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"webmcp_list"));
         assert!(!WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"navigate"));
     }
 }

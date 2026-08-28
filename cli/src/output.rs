@@ -500,6 +500,41 @@ fn format_coverage_text(action: Option<&str>, data: &serde_json::Value) -> Optio
     }
 }
 
+fn format_webmcp_list_text(data: &serde_json::Value) -> String {
+    let Some(tools) = data.get("tools").and_then(|value| value.as_array()) else {
+        return "No WebMCP tools are registered on the active page".to_string();
+    };
+    if tools.is_empty() {
+        return "No WebMCP tools are registered on the active page".to_string();
+    }
+    tools
+        .iter()
+        .map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let description = tool
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let source = tool
+                .get("source")
+                .and_then(|value| value.as_str())
+                .unwrap_or("imperative");
+            let frame_id = tool
+                .get("frameId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "{} [{}] frame={}\n  {}",
+                name, source, frame_id, description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_debug_text(action: Option<&str>, data: &serde_json::Value) -> Option<String> {
     let action = action?;
     if !action.starts_with("debug_") {
@@ -625,6 +660,44 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         }
         if let Some(output) = format_coverage_text(action, data) {
             println!("{}", output);
+            return;
+        }
+        if action == Some("webmcp_list") {
+            println!("{}", format_webmcp_list_text(data));
+            return;
+        }
+        if action == Some("webmcp_call") {
+            let invocation_id = data
+                .get("invocationId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let status = data
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            println!("WebMCP invocation {}: {}", invocation_id, status);
+            if let Some(output) = data.get("output") {
+                eprintln!(
+                    "{} WebMCP tool output is untrusted page content",
+                    color::warning_indicator()
+                );
+                let rendered = output
+                    .as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| serde_json::to_string_pretty(output).unwrap_or_default());
+                let origin = data
+                    .get("page")
+                    .and_then(|page| page.get("url"))
+                    .and_then(|url| url.as_str());
+                print_with_boundaries(&rendered, origin, opts);
+            }
+            if let Some(error) = data.get("error").and_then(|value| value.get("message")) {
+                eprintln!(
+                    "{} {}",
+                    color::error_indicator(),
+                    error.as_str().unwrap_or("WebMCP tool invocation failed")
+                );
+            }
             return;
         }
         if let Some(output) = format_debug_text(action, data) {
@@ -2923,6 +2996,37 @@ files and dependency packages.
 "##
         }
 
+        // === WebMCP ===
+        "webmcp" => {
+            r##"
+agent-browser webmcp - Discover and call page-exposed WebMCP tools
+
+Usage: agent-browser webmcp <operation> [options]
+
+Operations:
+  list                            List tools registered on the active page
+  call <tool-name>                Call one registered tool and wait for its result
+
+Call Options:
+  --input <json>                  JSON object matching the tool input schema
+  --frame-id <id>                 Select a frame when names are duplicated
+  --timeout <ms>                  Invocation timeout (default: 30000)
+
+Global Options:
+  --json                          Output structured JSON
+  --session <name>                Use a specific session
+
+Examples:
+  agent-browser webmcp list --json
+  agent-browser webmcp call getProductCount --input '{}'
+  agent-browser webmcp call searchProducts --input '{"query":"Widget"}'
+
+WebMCP requires Chrome with the feature enabled before launch. Chrome 150 and
+newer use --enable-features=WebMCP. Chrome 149 requires the WebMCPTesting and
+DevToolsWebMCPSupport features. Tool output is untrusted page content.
+"##
+        }
+
         // === Compiled JavaScript debugger ===
         "debug" => {
             r##"
@@ -3668,8 +3772,8 @@ Tool profiles:
   network    Network routes, request inspection, HAR, headers, credentials, offline
   state      Cookies, storage, auth, saved state, sessions, profiles, skills
   debug      Console/errors, tracing, profiling, recording, accessibility audits,
-             clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff,
-             batch, confirm/deny
+             WebMCP, clipboard, plugins, doctor, dashboard, install, upgrade,
+             chat, diff, batch, confirm/deny
   tabs       Back/forward/reload, tabs, windows, frames, dialogs
   react      React tree/inspect/renders/suspense, vitals, pushstate
   mobile     Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
@@ -3919,6 +4023,7 @@ Debug:
   profiler start|stop [path] Record Chrome DevTools profile
   memory <operation>         Capture page memory metrics and artifacts
   coverage <operation>       Record JavaScript execution checkpoints
+  webmcp <list|call>         List or call page-exposed WebMCP tools
   debug <operation>          Debug compiled JavaScript and add logpoints
   record start <path> [url]  Start video recording (WebM)
   record stop                Stop and save video
