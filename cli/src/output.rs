@@ -2567,6 +2567,11 @@ Settings:
   device <name>              Emulate device (e.g., "iPhone 12")
   geo <lat> <lng>            Set geolocation
   offline [on|off]           Toggle offline mode
+  cpu-throttling <rate>      Set CPU slowdown factor (finite number >= 1)
+  cpu-throttling reset       Restore normal CPU speed
+  network-throttling         Update network conditions; omitted values persist
+    [--latency-ms <n>] [--download-kbps <n>] [--upload-kbps <n>]
+  network-throttling reset   Restore online, zero-latency, unlimited network
   headers <json>             Set extra HTTP headers
   credentials <user> <pass>  Set HTTP authentication
   media [dark|light]         Set color scheme preference
@@ -2582,6 +2587,9 @@ Examples:
   agent-browser set device "iPhone 12"
   agent-browser set geo 37.7749 -122.4194
   agent-browser set offline on
+  agent-browser set cpu-throttling 4
+  agent-browser set network-throttling --latency-ms 150 --download-kbps 1600 --upload-kbps 750
+  agent-browser set network-throttling reset
   agent-browser set headers '{"X-Custom": "value"}'
   agent-browser set credentials admin secret123
   agent-browser set media dark
@@ -3855,7 +3863,8 @@ combine profiles with commas, such as --tools core,network,react.
 Tool profiles:
   core       Default. Navigation, snapshots, interaction, waits, reads,
              screenshots, JavaScript eval, close, tab basics, and profile discovery
-  network    Network routes, request inspection, HAR, headers, credentials, offline
+  network    Network routes, inspection, HAR, headers, credentials, offline,
+             and network throttling
   state      Cookies, storage, auth, saved state, sessions, profiles, skills
   debug      Console/errors, tracing, profiling, recording, accessibility audits,
              WebMCP, clipboard, plugins, doctor, dashboard, install, upgrade,
@@ -4084,6 +4093,9 @@ Mouse:  agent-browser mouse <action> [args]
 Browser Settings:  agent-browser set <setting> [value]
   viewport <w> <h>, device <name>, geo <lat> <lng>
   offline [on|off], headers <json>, credentials <user> <pass>
+  cpu-throttling <rate|reset>
+  network-throttling [--latency-ms <n>] [--download-kbps <n>]
+                     [--upload-kbps <n>] | reset
   media [dark|light] [reduced-motion]
 
 Network:  agent-browser network <action>

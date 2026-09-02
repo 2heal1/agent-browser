@@ -527,6 +527,9 @@ pub struct DaemonState {
     /// second attachment event when returning to an already-attached tab.
     /// Target.detachedFromTarget events remove stale sessions.
     pub iframe_sessions: HashMap<String, String>,
+    /// Worker-like target id → CDP session id. Network throttling is applied
+    /// to these sessions, while CPU throttling remains page and iframe only.
+    pub worker_sessions: HashMap<String, String>,
     /// Dedicated iframe sessions reachable from the currently active page.
     /// Network tracking uses this subset so background-tab iframe traffic is
     /// not mixed into the active tab's request list or HAR capture.
@@ -538,6 +541,9 @@ pub struct DaemonState {
     /// Proxy authentication credentials (username, password) for handling
     /// Fetch.authRequired events from authenticated proxies.
     pub proxy_credentials: Arc<RwLock<Option<(String, String)>>>,
+    /// Session-wide emulation settings applied to existing and newly attached
+    /// Chromium page, iframe, and supported worker targets.
+    pub throttling: Arc<RwLock<network::ThrottlingConfig>>,
     /// Background task that processes Fetch.requestPaused events in real-time,
     /// handling domain filtering, route interception, and origin-scoped headers
     /// without deadlocking navigation/evaluate.
@@ -706,8 +712,10 @@ impl DaemonState {
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
+            worker_sessions: HashMap::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
             proxy_credentials: Arc::new(RwLock::new(None)),
+            throttling: Arc::new(RwLock::new(network::ThrottlingConfig::default())),
             fetch_handler_task: None,
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
@@ -820,6 +828,7 @@ impl DaemonState {
         let routes = self.routes.clone();
         let origin_headers = self.origin_headers.clone();
         let proxy_credentials = self.proxy_credentials.clone();
+        let throttling = self.throttling.clone();
 
         self.fetch_handler_task = Some(tokio::spawn(async move {
             loop {
@@ -881,7 +890,12 @@ impl DaemonState {
 
                         let df = domain_filter.read().await.clone();
                         let has_proxy_creds = proxy_credentials.read().await.is_some();
-                        let controls_active = df.is_some() || has_proxy_creds;
+                        let throttling_config = *throttling.read().await;
+                        let controls_active = network_controls_required(
+                            df.as_ref(),
+                            has_proxy_creds,
+                            &throttling_config,
+                        );
                         let controls_result = if controls_active && target_needs_controls {
                             async {
                                 if let Some(ref target) = target_info {
@@ -896,6 +910,7 @@ impl DaemonState {
                                             df.as_ref(),
                                             has_proxy_creds,
                                             target,
+                                            &throttling_config,
                                         )
                                         .await
                                     } else {
@@ -904,6 +919,7 @@ impl DaemonState {
                                             &sid,
                                             df.as_ref(),
                                             has_proxy_creds,
+                                            &throttling_config,
                                         )
                                         .await
                                     }
@@ -1143,6 +1159,7 @@ impl DaemonState {
         for target_id in &drained.destroyed_targets {
             self.memory_state.cancel_target(target_id);
             self.coverage_state.cancel_target(target_id);
+            self.worker_sessions.remove(target_id);
             if let Some(ref mut mgr) = self.browser {
                 mgr.remove_page_by_target_id(target_id);
             }
@@ -1154,7 +1171,9 @@ impl DaemonState {
                 .insert(frame_id.clone(), iframe_sid.clone());
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let throttling = *self.throttling.read().await;
+            let controls_active =
+                network_controls_required(filter.as_ref(), has_proxy_creds, &throttling);
             let setup_result = if let Some(ref mgr) = self.browser {
                 async {
                     mgr.prepare_domains_pub(iframe_sid).await?;
@@ -1172,6 +1191,7 @@ impl DaemonState {
                             iframe_sid,
                             filter.as_ref(),
                             has_proxy_creds,
+                            &throttling,
                         )
                         .await?;
                     }
@@ -1197,7 +1217,9 @@ impl DaemonState {
         for (target_info, page_sid) in &drained.attached_page_sessions {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let throttling = *self.throttling.read().await;
+            let controls_active =
+                network_controls_required(filter.as_ref(), has_proxy_creds, &throttling);
             let setup_result = if let Some(ref mut mgr) = self.browser {
                 async {
                     mgr.prepare_domains_pub(page_sid).await?;
@@ -1207,6 +1229,7 @@ impl DaemonState {
                             page_sid,
                             filter.as_ref(),
                             has_proxy_creds,
+                            &throttling,
                         )
                         .await?;
                     }
@@ -1266,9 +1289,13 @@ impl DaemonState {
         }
 
         for (target_info, worker_sid) in &drained.attached_worker_sessions {
+            self.worker_sessions
+                .insert(target_info.target_id.clone(), worker_sid.clone());
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let throttling = *self.throttling.read().await;
+            let controls_active =
+                network_controls_required(filter.as_ref(), has_proxy_creds, &throttling);
             let setup_result = if let Some(ref mgr) = self.browser {
                 async {
                     prepare_network_control_target_session(&mgr.client, worker_sid, target_info)
@@ -1280,6 +1307,7 @@ impl DaemonState {
                             filter.as_ref(),
                             has_proxy_creds,
                             target_info,
+                            &throttling,
                         )
                         .await?;
                     }
@@ -1317,13 +1345,16 @@ impl DaemonState {
         for sid in &drained.detached_iframe_sessions {
             self.iframe_sessions.retain(|_, v| v != sid);
             self.active_iframe_sessions.remove(sid);
+            self.worker_sessions.retain(|_, known_sid| known_sid != sid);
         }
 
         // Attach and register new targets
         for te in &drained.new_targets {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let throttling = *self.throttling.read().await;
+            let controls_active =
+                network_controls_required(filter.as_ref(), has_proxy_creds, &throttling);
             let setup_result = if let Some(ref mut mgr) = self.browser {
                 async {
                     let attach: AttachToTargetResult = mgr
@@ -1344,6 +1375,7 @@ impl DaemonState {
                             &attach.session_id,
                             filter.as_ref(),
                             has_proxy_creds,
+                            &throttling,
                         )
                         .await?;
                     }
@@ -2374,6 +2406,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
     state.active_iframe_sessions.clear();
+    state.worker_sessions.clear();
     state.webmcp.clear_all();
     state.screencasting = false;
     state.reset_input_state();
@@ -2910,6 +2943,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "setcontent" => handle_setcontent(cmd, state).await,
         "headers" => handle_headers(cmd, state).await,
         "offline" => handle_offline(cmd, state).await,
+        "cpu_throttling" => handle_cpu_throttling(cmd, state).await,
+        "network_throttling" => handle_network_throttling(cmd, state).await,
         "console" => handle_console(cmd, state).await,
         "errors" => handle_errors(state).await,
         "session_info" => handle_session_info(state).await,
@@ -3415,8 +3450,12 @@ fn check_url_allowed_by_filter(filter: Option<&DomainFilter>, url: &str) -> Resu
     Ok(())
 }
 
-fn network_controls_required(filter: Option<&DomainFilter>, handle_auth_requests: bool) -> bool {
-    filter.is_some() || handle_auth_requests
+fn network_controls_required(
+    filter: Option<&DomainFilter>,
+    handle_auth_requests: bool,
+    throttling: &network::ThrottlingConfig,
+) -> bool {
+    filter.is_some() || handle_auth_requests || throttling.is_active()
 }
 
 fn should_defer_url_until_network_controls(
@@ -3656,6 +3695,7 @@ async fn install_network_controls_for_session(
     session_id: &str,
     filter: Option<&DomainFilter>,
     handle_auth_requests: bool,
+    throttling: &network::ThrottlingConfig,
 ) -> Result<(), String> {
     if let Some(filter) = filter {
         network::install_domain_filter(
@@ -3668,6 +3708,12 @@ async fn install_network_controls_for_session(
     } else if handle_auth_requests {
         network::install_domain_filter_fetch(client, session_id, true).await?;
     }
+    if throttling.network.is_active() {
+        network::apply_network_conditions(client, session_id, throttling.network).await?;
+    }
+    if throttling.cpu_rate > 1.0 {
+        network::apply_cpu_throttling(client, session_id, throttling.cpu_rate).await?;
+    }
 
     Ok(())
 }
@@ -3678,6 +3724,7 @@ async fn install_worker_network_controls_for_session(
     filter: Option<&DomainFilter>,
     handle_auth_requests: bool,
     target: &TargetInfo,
+    throttling: &network::ThrottlingConfig,
 ) -> Result<(), String> {
     if filter.is_some() {
         if target_supports_worker_fetch_controls(target) {
@@ -3686,7 +3733,86 @@ async fn install_worker_network_controls_for_session(
     } else if handle_auth_requests && target_supports_worker_fetch_controls(target) {
         network::install_domain_filter_fetch(client, session_id, true).await?;
     }
+    if throttling.network.is_active() {
+        network::apply_worker_network_conditions(client, session_id, throttling.network).await?;
+    }
 
+    Ok(())
+}
+
+fn ensure_throttling_supported(state: &DaemonState) -> Result<(), String> {
+    if matches!(state.backend_type, BackendType::WebDriver) || state.engine != "chrome" {
+        return Err(format!(
+            "throttling_unsupported: CPU and network throttling require a Chromium CDP target; active engine is {}",
+            state.engine
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_throttling_auto_attach(
+    state: &mut DaemonState,
+    config: &network::ThrottlingConfig,
+) -> Result<(), String> {
+    if !config.is_active() || state.network_auto_attach_installed {
+        return Ok(());
+    }
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    if !mgr.is_direct_page_connection() {
+        mgr.enable_browser_auto_attach_pub().await?;
+        state.network_auto_attach_installed = true;
+    }
+    Ok(())
+}
+
+fn append_unique_session_ids(
+    session_ids: &mut Vec<String>,
+    additional: impl Iterator<Item = String>,
+) {
+    for session_id in additional {
+        if !session_ids.iter().any(|known| known == &session_id) {
+            session_ids.push(session_id);
+        }
+    }
+}
+
+async fn apply_cpu_to_current_sessions(state: &mut DaemonState, rate: f64) -> Result<(), String> {
+    ensure_throttling_supported(state)?;
+    let config = network::ThrottlingConfig {
+        cpu_rate: rate,
+        network: state.throttling.read().await.network,
+    };
+    ensure_throttling_auto_attach(state, &config).await?;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let mut session_ids = network_control_session_ids(mgr)?;
+    append_unique_session_ids(&mut session_ids, state.iframe_sessions.values().cloned());
+    for session_id in session_ids {
+        network::apply_cpu_throttling(&mgr.client, &session_id, rate).await?;
+    }
+    Ok(())
+}
+
+async fn apply_network_to_current_sessions(
+    state: &mut DaemonState,
+    conditions: network::NetworkConditions,
+) -> Result<(), String> {
+    ensure_throttling_supported(state)?;
+    let config = network::ThrottlingConfig {
+        cpu_rate: state.throttling.read().await.cpu_rate,
+        network: conditions,
+    };
+    ensure_throttling_auto_attach(state, &config).await?;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let mut session_ids = network_control_session_ids(mgr)?;
+    append_unique_session_ids(&mut session_ids, state.iframe_sessions.values().cloned());
+    for session_id in session_ids {
+        network::apply_network_conditions(&mgr.client, &session_id, conditions).await?;
+    }
+    for session_id in state.worker_sessions.values() {
+        network::apply_worker_network_conditions(&mgr.client, session_id, conditions).await?;
+    }
     Ok(())
 }
 
@@ -3695,7 +3821,8 @@ async fn install_active_network_controls(
     handle_auth_requests: bool,
 ) -> Result<(), String> {
     let filter = state.domain_filter.read().await.clone();
-    if !network_controls_required(filter.as_ref(), handle_auth_requests) {
+    let throttling = *state.throttling.read().await;
+    if !network_controls_required(filter.as_ref(), handle_auth_requests, &throttling) {
         return Ok(());
     }
 
@@ -3734,6 +3861,7 @@ async fn install_active_network_controls(
             &session_id,
             filter.as_ref(),
             handle_auth_requests,
+            &throttling,
         )
         .await?;
         mgr.resume_if_waiting_pub(&session_id).await?;
@@ -3762,7 +3890,8 @@ async fn install_network_controls_or_resume_prepared_session(
     session_id: &str,
 ) -> Result<(), String> {
     let filter = state.domain_filter.read().await.clone();
-    if network_controls_required(filter.as_ref(), handle_auth_requests) {
+    let throttling = *state.throttling.read().await;
+    if network_controls_required(filter.as_ref(), handle_auth_requests, &throttling) {
         install_network_controls_or_close(state, handle_auth_requests).await
     } else {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -6585,12 +6714,90 @@ async fn handle_headers(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
     Ok(json!({ "set": true }))
 }
 
-async fn handle_offline(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+async fn update_network_conditions(
+    state: &mut DaemonState,
+    conditions: network::NetworkConditions,
+) -> Result<Value, String> {
+    let previous = *state.throttling.read().await;
+    {
+        let mut throttling = state.throttling.write().await;
+        throttling.network = conditions;
+    }
+    if let Err(error) = apply_network_to_current_sessions(state, conditions).await {
+        *state.throttling.write().await = previous;
+        let _ = apply_network_to_current_sessions(state, previous.network).await;
+        return Err(error);
+    }
+    Ok(conditions.to_json())
+}
+
+async fn handle_offline(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let offline = cmd.get("offline").and_then(|v| v.as_bool()).unwrap_or(true);
-    network::set_offline(&mgr.client, &session_id, offline).await?;
-    Ok(json!({ "offline": offline }))
+    let mut conditions = state.throttling.read().await.network;
+    conditions.offline = offline;
+    update_network_conditions(state, conditions).await
+}
+
+async fn handle_cpu_throttling(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let rate = if cmd.get("reset").and_then(Value::as_bool) == Some(true) {
+        1.0
+    } else {
+        cmd.get("rate")
+            .and_then(Value::as_f64)
+            .filter(|rate| rate.is_finite() && *rate >= 1.0)
+            .ok_or("CPU throttling rate must be a finite number greater than or equal to 1")?
+    };
+    let previous = *state.throttling.read().await;
+    {
+        let mut throttling = state.throttling.write().await;
+        throttling.cpu_rate = rate;
+    }
+    if let Err(error) = apply_cpu_to_current_sessions(state, rate).await {
+        *state.throttling.write().await = previous;
+        let _ = apply_cpu_to_current_sessions(state, previous.cpu_rate).await;
+        return Err(error);
+    }
+    Ok(json!({ "rate": rate }))
+}
+
+async fn handle_network_throttling(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let reset = cmd.get("reset").and_then(Value::as_bool) == Some(true);
+    let has_values = ["latencyMs", "downloadKbps", "uploadKbps"]
+        .iter()
+        .any(|field| cmd.get(*field).is_some());
+    if reset && has_values {
+        return Err("network throttling reset does not accept other parameters".to_string());
+    }
+    if !reset && !has_values {
+        return Err(
+            "network throttling requires at least one latency or throughput parameter".to_string(),
+        );
+    }
+    let parse_value = |field: &str| -> Result<Option<f64>, String> {
+        cmd.get(field)
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| format!("{} must be a finite non-negative number", field))
+            })
+            .transpose()
+    };
+    let mut conditions = if reset {
+        network::NetworkConditions::default()
+    } else {
+        state.throttling.read().await.network
+    };
+    if let Some(value) = parse_value("latencyMs")? {
+        conditions.latency_ms = value;
+    }
+    if let Some(value) = parse_value("downloadKbps")? {
+        conditions.download_kbps = Some(value);
+    }
+    if let Some(value) = parse_value("uploadKbps")? {
+        conditions.upload_kbps = Some(value);
+    }
+    update_network_conditions(state, conditions).await
 }
 
 async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -12582,7 +12789,7 @@ fn error_response(id: &str, error: &str) -> Value {
     if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
     } else if let Some((code, _)) = error.split_once(": ") {
-        if code.starts_with("webmcp_") {
+        if code.starts_with("webmcp_") || code.starts_with("throttling_") {
             resp["code"] = json!(code);
         }
     }
@@ -14405,6 +14612,20 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(error.contains("active backend is lightpanda"));
     }
 
+    #[test]
+    fn test_throttling_unsupported_error_is_machine_readable() {
+        let mut state = DaemonState::new();
+        state.engine = "lightpanda".to_string();
+
+        let error = ensure_throttling_supported(&state).unwrap_err();
+        let resp = error_response("cmd-throttling", &error);
+
+        assert_eq!(resp["success"], false);
+        assert_eq!(resp["code"], "throttling_unsupported");
+        assert!(error.contains("Chromium CDP target"));
+        assert!(error.contains("lightpanda"));
+    }
+
     #[tokio::test]
     async fn test_daemon_state_new() {
         let guard = EnvGuard::new(&[
@@ -14833,11 +15054,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
-    fn test_network_controls_required_only_when_filter_or_proxy_auth_active() {
+    fn test_network_controls_required_for_filter_proxy_or_throttling() {
         let filter = DomainFilter::new("example.com");
-        assert!(!network_controls_required(None, false));
-        assert!(network_controls_required(Some(&filter), false));
-        assert!(network_controls_required(None, true));
+        let normal = network::ThrottlingConfig::default();
+        let throttled = network::ThrottlingConfig {
+            cpu_rate: 4.0,
+            ..normal
+        };
+        assert!(!network_controls_required(None, false, &normal));
+        assert!(network_controls_required(Some(&filter), false, &normal));
+        assert!(network_controls_required(None, true, &normal));
+        assert!(network_controls_required(None, false, &throttled));
     }
 
     #[test]

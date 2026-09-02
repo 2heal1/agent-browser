@@ -305,10 +305,17 @@ agent-browser set viewport <w> <h> [scale]  # Set viewport size (scale for retin
 agent-browser set device <name>       # Emulate device ("iPhone 14")
 agent-browser set geo <lat> <lng>     # Set geolocation
 agent-browser set offline [on|off]    # Toggle offline mode
+agent-browser set cpu-throttling <rate|reset>
+agent-browser set network-throttling [--latency-ms <n>] [--download-kbps <n>] [--upload-kbps <n>]
+agent-browser set network-throttling reset
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth
 agent-browser set media [dark|light]  # Emulate color scheme
 ```
+
+CPU throttling uses a slowdown factor of `1` or greater. Network throughput values use decimal kilobits per second and omitted options preserve their current values. `set offline on` temporarily disconnects the browser without discarding configured latency or throughput limits; `set offline off` restores those limits, while `set network-throttling reset` restores an online connection with no added latency and unlimited throughput.
+
+Throttling is available only for Chromium CDP sessions. Settings persist across navigation and reload and are applied to new tabs, popups, and cross-origin iframes. Network conditions also apply to supported attached worker targets. CPU throttling covers page and iframe renderers but is not complete low-end device emulation: it does not simulate memory, GPU, disk, core count, or thermal limits. General HTTP/TCP packet loss and random jitter require a proxy or operating-system network layer; CDP `packetLoss` is WebRTC-specific and is not exposed by these commands.
 
 ### Cookies & Storage
 
@@ -681,12 +688,12 @@ The default tools profile is `core`, which keeps MCP context small for everyday 
 Profiles:
 
 - `core` — Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
-- `network` — Network routes, request inspection, HAR, headers, credentials, offline
+- `network` — Network routes, request inspection, HAR, headers, credentials, offline, and network throttling
 - `state` — Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` — Compiled JavaScript breakpoints, logpoints, pause recovery, WebMCP list/call, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
 - `react` — React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `mobile` — Viewport/device/geolocation/media and CPU throttling, plus touch, swipe, mouse, keyboard
 - `all` — Every MCP tool, including the full typed CLI parity surface
 
 Common tools include:

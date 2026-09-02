@@ -3,6 +3,248 @@ use std::collections::HashMap;
 
 use super::cdp::client::CdpClient;
 
+const NETWORK_BY_RULE_METHOD: &str = "Network.emulateNetworkConditionsByRule";
+const NETWORK_OVERRIDE_METHOD: &str = "Network.overrideNetworkState";
+const NETWORK_LEGACY_METHOD: &str = "Network.emulateNetworkConditions";
+const CPU_THROTTLING_METHOD: &str = "Emulation.setCPUThrottlingRate";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetworkConditions {
+    pub offline: bool,
+    pub latency_ms: f64,
+    pub download_kbps: Option<f64>,
+    pub upload_kbps: Option<f64>,
+}
+
+impl Default for NetworkConditions {
+    fn default() -> Self {
+        Self {
+            offline: false,
+            latency_ms: 0.0,
+            download_kbps: None,
+            upload_kbps: None,
+        }
+    }
+}
+
+impl NetworkConditions {
+    pub fn is_active(&self) -> bool {
+        self.offline
+            || self.latency_ms > 0.0
+            || self.download_kbps.is_some()
+            || self.upload_kbps.is_some()
+    }
+
+    pub fn to_json(self) -> Value {
+        json!({
+            "offline": self.offline,
+            "latencyMs": self.latency_ms,
+            "downloadKbps": self.download_kbps,
+            "uploadKbps": self.upload_kbps,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThrottlingConfig {
+    pub cpu_rate: f64,
+    pub network: NetworkConditions,
+}
+
+impl Default for ThrottlingConfig {
+    fn default() -> Self {
+        Self {
+            cpu_rate: 1.0,
+            network: NetworkConditions::default(),
+        }
+    }
+}
+
+impl ThrottlingConfig {
+    pub fn is_active(&self) -> bool {
+        self.cpu_rate > 1.0 || self.network.is_active()
+    }
+}
+
+fn throughput_bytes_per_second(kbps: Option<f64>) -> f64 {
+    kbps.map(|value| value * 1000.0 / 8.0).unwrap_or(-1.0)
+}
+
+fn network_condition_values(conditions: NetworkConditions) -> (f64, f64) {
+    (
+        throughput_bytes_per_second(conditions.download_kbps),
+        throughput_bytes_per_second(conditions.upload_kbps),
+    )
+}
+
+fn modern_rule_params(conditions: NetworkConditions) -> Value {
+    let (download_throughput, upload_throughput) = network_condition_values(conditions);
+    let matched = vec![json!({
+        "urlPattern": "",
+        "offline": conditions.offline,
+        "latency": conditions.latency_ms,
+        "downloadThroughput": download_throughput,
+        "uploadThroughput": upload_throughput,
+    })];
+    json!({
+        "offline": conditions.offline,
+        "matchedNetworkConditions": matched,
+    })
+}
+
+fn network_override_params(conditions: NetworkConditions) -> Value {
+    let (download_throughput, upload_throughput) = network_condition_values(conditions);
+    json!({
+        "offline": conditions.offline,
+        "latency": conditions.latency_ms,
+        "downloadThroughput": download_throughput,
+        "uploadThroughput": upload_throughput,
+    })
+}
+
+fn legacy_network_params(conditions: NetworkConditions) -> Value {
+    network_override_params(conditions)
+}
+
+fn method_is_unsupported(error: &str, method: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    (lower.contains("method not found")
+        || lower.contains("wasn't found")
+        || lower.contains("was not found")
+        || lower.contains("-32601"))
+        && lower.contains(&method.to_ascii_lowercase())
+}
+
+fn unsupported_error(capability: &str, detail: &str) -> String {
+    format!(
+        "throttling_unsupported: {} requires a Chromium CDP target with emulation support. CDP detail: {}",
+        capability, detail
+    )
+}
+
+pub async fn apply_network_conditions(
+    client: &CdpClient,
+    session_id: &str,
+    conditions: NetworkConditions,
+) -> Result<(), String> {
+    apply_network_conditions_internal(client, session_id, conditions, true).await
+}
+
+pub async fn apply_worker_network_conditions(
+    client: &CdpClient,
+    session_id: &str,
+    conditions: NetworkConditions,
+) -> Result<(), String> {
+    apply_network_conditions_internal(client, session_id, conditions, false).await
+}
+
+async fn apply_network_conditions_internal(
+    client: &CdpClient,
+    session_id: &str,
+    conditions: NetworkConditions,
+    override_navigator_state: bool,
+) -> Result<(), String> {
+    client
+        .send_command_no_params("Network.enable", Some(session_id))
+        .await
+        .map_err(|error| {
+            if method_is_unsupported(&error, "Network.enable") {
+                unsupported_error("network throttling", &error)
+            } else {
+                error
+            }
+        })?;
+
+    match client
+        .send_command(
+            NETWORK_BY_RULE_METHOD,
+            Some(modern_rule_params(conditions)),
+            Some(session_id),
+        )
+        .await
+    {
+        Ok(_) => {
+            if !override_navigator_state {
+                return Ok(());
+            }
+            if let Err(error) = client
+                .send_command(
+                    NETWORK_OVERRIDE_METHOD,
+                    Some(network_override_params(conditions)),
+                    Some(session_id),
+                )
+                .await
+            {
+                if !method_is_unsupported(&error, NETWORK_OVERRIDE_METHOD) {
+                    return Err(error);
+                }
+                let _ = client
+                    .send_command(
+                        NETWORK_BY_RULE_METHOD,
+                        Some(modern_rule_params(NetworkConditions::default())),
+                        Some(session_id),
+                    )
+                    .await;
+                client
+                    .send_command(
+                        NETWORK_LEGACY_METHOD,
+                        Some(legacy_network_params(conditions)),
+                        Some(session_id),
+                    )
+                    .await
+                    .map_err(|legacy_error| {
+                        if method_is_unsupported(&legacy_error, NETWORK_LEGACY_METHOD) {
+                            unsupported_error("network throttling", &legacy_error)
+                        } else {
+                            legacy_error
+                        }
+                    })?;
+            }
+        }
+        Err(error) if method_is_unsupported(&error, NETWORK_BY_RULE_METHOD) => {
+            client
+                .send_command(
+                    NETWORK_LEGACY_METHOD,
+                    Some(legacy_network_params(conditions)),
+                    Some(session_id),
+                )
+                .await
+                .map_err(|legacy_error| {
+                    if method_is_unsupported(&legacy_error, NETWORK_LEGACY_METHOD) {
+                        unsupported_error("network throttling", &legacy_error)
+                    } else {
+                        legacy_error
+                    }
+                })?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    Ok(())
+}
+
+pub async fn apply_cpu_throttling(
+    client: &CdpClient,
+    session_id: &str,
+    rate: f64,
+) -> Result<(), String> {
+    client
+        .send_command(
+            CPU_THROTTLING_METHOD,
+            Some(json!({ "rate": rate })),
+            Some(session_id),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            if method_is_unsupported(&error, CPU_THROTTLING_METHOD) {
+                unsupported_error("CPU throttling", &error)
+            } else {
+                error
+            }
+        })
+}
+
 pub async fn set_extra_headers(
     client: &CdpClient,
     session_id: &str,
@@ -22,26 +264,6 @@ pub async fn set_extra_headers(
         )
         .await?;
 
-    Ok(())
-}
-
-pub async fn set_offline(
-    client: &CdpClient,
-    session_id: &str,
-    offline: bool,
-) -> Result<(), String> {
-    client
-        .send_command(
-            "Network.emulateNetworkConditions",
-            Some(json!({
-                "offline": offline,
-                "latency": 0,
-                "downloadThroughput": -1,
-                "uploadThroughput": -1,
-            })),
-            Some(session_id),
-        )
-        .await?;
     Ok(())
 }
 
@@ -662,6 +884,148 @@ impl EventTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    async fn recording_client(
+        command_count: usize,
+        unsupported_method: Option<&str>,
+    ) -> (CdpClient, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let unsupported_method = unsupported_method.map(ToString::to_string);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut commands = Vec::new();
+            while commands.len() < command_count {
+                let message = websocket.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let id = command["id"].as_u64().unwrap();
+                let method = command["method"].as_str().unwrap_or_default();
+                let response = if unsupported_method.as_deref() == Some(method) {
+                    json!({
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("'{}' wasn't found", method)
+                        }
+                    })
+                } else {
+                    json!({ "id": id, "result": {} })
+                };
+                commands.push(command);
+                websocket
+                    .send(Message::Text(response.to_string()))
+                    .await
+                    .unwrap();
+            }
+            commands
+        });
+        let client = CdpClient::connect(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn network_conditions_convert_decimal_kbps_to_bytes_per_second() {
+        let params = network_override_params(NetworkConditions {
+            offline: false,
+            latency_ms: 150.0,
+            download_kbps: Some(1600.0),
+            upload_kbps: Some(750.0),
+        });
+        assert_eq!(params["downloadThroughput"], 200_000.0);
+        assert_eq!(params["uploadThroughput"], 93_750.0);
+        assert_eq!(params["latency"], 150.0);
+    }
+
+    #[test]
+    fn network_reset_uses_noop_rule_and_restores_unlimited_throughput() {
+        let conditions = NetworkConditions::default();
+        let rule = &modern_rule_params(conditions)["matchedNetworkConditions"][0];
+        assert_eq!(rule["offline"], false);
+        assert_eq!(rule["latency"], 0.0);
+        assert_eq!(rule["downloadThroughput"], -1.0);
+        assert_eq!(rule["uploadThroughput"], -1.0);
+        let override_params = network_override_params(conditions);
+        assert_eq!(override_params["offline"], false);
+        assert_eq!(override_params["latency"], 0.0);
+        assert_eq!(override_params["downloadThroughput"], -1.0);
+        assert_eq!(override_params["uploadThroughput"], -1.0);
+    }
+
+    #[tokio::test]
+    async fn applies_modern_network_methods_and_parameters() {
+        let (client, server) = recording_client(3, None).await;
+        let conditions = NetworkConditions {
+            offline: false,
+            latency_ms: 125.0,
+            download_kbps: Some(800.0),
+            upload_kbps: Some(400.0),
+        };
+        apply_network_conditions(&client, "session-1", conditions)
+            .await
+            .unwrap();
+        let commands = server.await.unwrap();
+        assert_eq!(commands[0]["method"], "Network.enable");
+        assert_eq!(
+            commands[1]["method"],
+            "Network.emulateNetworkConditionsByRule"
+        );
+        assert_eq!(commands[1]["sessionId"], "session-1");
+        assert_eq!(
+            commands[1]["params"]["matchedNetworkConditions"][0]["downloadThroughput"],
+            100_000.0
+        );
+        assert_eq!(commands[2]["method"], "Network.overrideNetworkState");
+        assert_eq!(commands[2]["params"]["uploadThroughput"], 50_000.0);
+    }
+
+    #[tokio::test]
+    async fn falls_back_only_when_modern_network_method_is_missing() {
+        let (client, server) =
+            recording_client(3, Some("Network.emulateNetworkConditionsByRule")).await;
+        apply_network_conditions(
+            &client,
+            "session-2",
+            NetworkConditions {
+                latency_ms: 20.0,
+                ..NetworkConditions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let commands = server.await.unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Network.enable",
+                "Network.emulateNetworkConditionsByRule",
+                "Network.emulateNetworkConditions"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_cpu_throttling_rate_to_emulation_domain() {
+        let (client, server) = recording_client(1, None).await;
+        apply_cpu_throttling(&client, "session-3", 4.0)
+            .await
+            .unwrap();
+        let commands = server.await.unwrap();
+        assert_eq!(commands[0]["method"], "Emulation.setCPUThrottlingRate");
+        assert_eq!(commands[0]["params"]["rate"], 4.0);
+        assert_eq!(commands[0]["sessionId"], "session-3");
+    }
 
     #[test]
     fn test_domain_filter_exact() {

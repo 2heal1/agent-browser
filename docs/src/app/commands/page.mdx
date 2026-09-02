@@ -172,10 +172,17 @@ agent-browser set viewport <w> <h> [scale]  # Set viewport size (scale for retin
 agent-browser set device <name>       # Emulate device ("iPhone 14")
 agent-browser set geo <lat> <lng>     # Set geolocation
 agent-browser set offline [on|off]    # Toggle offline mode
+agent-browser set cpu-throttling <rate|reset>
+agent-browser set network-throttling [--latency-ms <n>] [--download-kbps <n>] [--upload-kbps <n>]
+agent-browser set network-throttling reset
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth
 agent-browser set media [dark|light]  # Emulate color scheme (persists for session)
 ```
+
+CPU throttling uses a slowdown factor of `1` or greater. Network values use decimal kilobits per second. Omitted network options keep their current values. Offline mode preserves configured latency and throughput limits, while `network-throttling reset` restores an online, zero-latency, unlimited connection.
+
+These controls require Chromium CDP. They persist across navigation and apply to new tabs, popups, and cross-origin iframes. CPU throttling is not complete low-end device emulation and does not simulate memory, GPU, disk, core count, or thermal behavior.
 
 Use `--color-scheme` for persistent dark/light mode across all commands:
 
@@ -693,12 +700,12 @@ The default tools profile is `core`, which keeps MCP context small for everyday 
 Profiles:
 
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
-- `network` - Network routes, request inspection, HAR, headers, credentials, offline
+- `network` - Network routes, request inspection, HAR, headers, credentials, offline, network throttling
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` - WebMCP list/call, console/errors, tracing, profiling, recording, accessibility audits, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `mobile` - Viewport/device/geolocation/media and CPU throttling, plus touch, swipe, mouse, keyboard
 - `all` - Every MCP tool, including the full typed CLI parity surface
 
 Example MCP client config:
