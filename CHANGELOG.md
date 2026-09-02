@@ -1,8 +1,84 @@
 # agent-browser
 
-## 0.34.0
+## 0.36.0
 
 <!-- release:start -->
+### New Features
+
+- Added experimental **WebMCP support** for discovering and invoking tools provided by the current page, including frame-aware tool selection, detached results, cancellation, bounded metadata and output handling, and an opt-in MCP tool profile. WebMCP is enabled by default for locally managed Chrome and can be disabled with `--no-webmcp` or `AGENT_BROWSER_NO_WEBMCP`.
+- Added a **WebMCP generation skill** that helps agents expose existing page workflows as validated page tools while recording safety constraints, deterministic checks, and fallback behavior.
+
+### Improvements
+
+- Updated the **eve integration** to 0.47.3 and raised its compatibility floor to 0.39.1.
+- Updated **brace-expansion dependency resolutions** across the project lockfiles.
+
+### Bug Fixes
+
+- Removed the obsolete **Lightpanda session timeout** argument so launches use the current supported server options.
+
+### Contributors
+
+- @ctate
+- @Railly
+- @anupamme
+- @arrufat
+
+<!-- release:end -->
+
+## 0.35.2
+
+### Security
+
+- Hardened **dashboard origin validation and reverse-proxy access** with same-origin provenance enforcement that defends against DNS rebinding, form/header smuggling, and cross-origin requests. Reverse-proxied origins now require exact HTTPS allowlisting and generated token authentication, while tokenless IPv4 and IPv6 loopback access remains supported. Dashboard options are validated strictly, and CLI and MCP lifecycle behavior is aligned (#1738)
+
+### Bug Fixes
+
+- Fixed **root remote CDP WebSocket URLs with query strings** to insert the required slash before the query while preserving the encoded query (#1735)
+
+### Contributors
+
+- @ctate
+- @Railly
+
+## 0.35.1
+
+### Bug Fixes
+
+- Fixed **Windows ARM64 launcher selection** to prefer a native ARM64 executable when present and fall back to the published x64 executable through Windows emulation when it is not (#1725)
+- Fixed **stream URL tracking** to emit active main-frame URL updates for full-document, History API, and fragment navigation, while rebinding correctly after active-tab changes and ignoring child-frame or background-tab navigation (#1682)
+- Fixed **snapshot diff element references** by resetting ref numbering for each diff, invalidating refs across URL navigations, and preserving the previous refs when a diff fails (#1719)
+
+### Improvements
+
+- Updated **Rust dependencies** to `rustls-webpki` 0.103.13 and `quinn-proto` 0.11.17 (#1723, #1720)
+
+### Contributors
+
+- @ctate
+- @Railly
+- @Angelmmiguel
+- @anupamme
+- @nexxusbruno-ship-it
+
+## 0.35.0
+
+### New Features
+
+- Added **private proxy CA trust for locally launched Chromium on Linux**. Use `--ca-cert <path>`, `AGENT_BROWSER_CA_CERT`, or `caCert` in config and MCP to import a PEM bundle or DER certificate into an isolated NSS trust store without disabling hostname, validity, or unrelated-authority verification. The effective CA persists across commands in a running session, equivalent certificate content reuses Chromium, and `--no-ca-cert` explicitly clears retained trust. Unsupported launch modes and conflicting CA options return actionable errors (#1669)
+
+### Improvements
+
+- Added a bundled **protected Vercel deployments skill** that guides agents through short-lived Trusted Sources OIDC authentication, authorized automation bypasses, and explicit human handoffs for dashboard-only configuration (#1705)
+
+### Contributors
+
+- @Railly
+- @ctate
+- @bilby91
+
+## 0.34.0
+
 ### New Features
 
 - Added **persistent session-to-tab binding for shared Chrome sessions**. Named sessions connected through `--cdp` or `--auto-connect` now remember their CDP target across commands and daemon restarts, and CDP target ids can be used directly as tab references. Start each session with `--pin-tab` to make the binding strict, so a tab closed externally returns a stable `tab_gone` error instead of silently adopting a neighboring tab. JSON output includes `data.targetId` and an optional sanitized `data.lastUrl`; batch exposes the same recovery data under `result` (#1589)
@@ -23,7 +99,6 @@
 - @soichisumi
 - @dandaka
 - @mvanhorn
-<!-- release:end -->
 
 ## 0.33.2
 

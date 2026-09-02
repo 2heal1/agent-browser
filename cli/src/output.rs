@@ -148,6 +148,55 @@ fn format_stream_status_text(action: Option<&str>, data: &serde_json::Value) -> 
     }
 }
 
+fn format_webmcp_text(action: Option<&str>, data: &serde_json::Value) -> Option<String> {
+    match action {
+        Some("webmcp_list") => {
+            let tools = data.get("tools")?.as_array()?;
+            if tools.is_empty() {
+                return Some("No WebMCP tools registered on the current page".to_string());
+            }
+            Some(
+                tools
+                    .iter()
+                    .map(format_webmcp_tool_text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+        Some("webmcp_invoke" | "webmcp_result" | "webmcp_cancel") => {
+            let invocation_id = data.get("invocationId")?.as_str()?;
+            let status = data.get("status")?.as_str()?;
+            let mut output = format!("{}: {}", invocation_id, status);
+            if let Some(result) = data.get("output") {
+                output.push('\n');
+                output.push_str(
+                    &serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
+                );
+            }
+            if let Some(error) = data.get("error").and_then(|v| v.as_str()) {
+                output.push('\n');
+                output.push_str(error);
+            }
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+fn format_webmcp_tool_text(tool: &serde_json::Value) -> String {
+    let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let description = tool
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let frame = tool.get("frameId").and_then(|v| v.as_str()).unwrap_or("?");
+    let origin = tool
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    format!("{} [{}]\n  {}\n  {}", name, frame, description, origin)
+}
+
 fn confirmation_data(data: &serde_json::Value) -> Option<&serde_json::Value> {
     if data
         .get("confirmation_required")
@@ -644,6 +693,23 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         }
         if let Some(output) = format_stream_status_text(action, data) {
             println!("{}", output);
+            return;
+        }
+        if action == Some("webmcp_list") {
+            let Some(tools) = data.get("tools").and_then(|tools| tools.as_array()) else {
+                return;
+            };
+            if tools.is_empty() {
+                println!("No WebMCP tools registered on the current page");
+                return;
+            }
+            for tool in tools {
+                print_with_boundaries(&format_webmcp_tool_text(tool), boundary_origin(tool), opts);
+            }
+            return;
+        }
+        if let Some(output) = format_webmcp_text(action, data) {
+            print_with_boundaries(&output, boundary_origin(data), opts);
             return;
         }
         if action == Some("vitals") {
@@ -3396,21 +3462,36 @@ browser viewports and command activity feeds for all sessions.
 The dashboard is bundled into the binary and requires no separate install.
 
 Subcommands:
-  start [--port <n>]   Start the dashboard server (default port: 4848)
+  start [--port <n>] [--allowed-origins <origins>]
+                        Start the dashboard server (default port: 4848)
   stop                 Stop the dashboard server
 
 Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard start'.
 
 The dashboard runs as a standalone background process, independent of
 browser sessions. All sessions automatically stream to the dashboard.
-It works from http://localhost:4848 or a proxied/forwarded URL that
-reaches the dashboard server, such as https://dashboard.agent-browser.localhost
-or a Coder workspace URL. The browser stays on the dashboard origin;
-session tabs, status, and stream traffic are proxied internally, so
-session ports do not need to be exposed.
+Loopback origins work without configuration or a token. For a reverse-proxied or
+forwarded dashboard, pass --allowed-origins with the exact browser origin
+or set AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS. The browser stays on the
+dashboard origin; session tabs, status, and stream traffic are proxied
+internally, so session ports do not need to be exposed.
+For reverse-proxied origins, start prints private external access URLs
+containing an unguessable fragment token. Open the matching URL to establish
+the browser session and do not share it. Loopback URLs do not require or
+receive this token. Configure a reverse proxy to redact cookies from logs.
+Stop the dashboard before changing its port or allowed origins.
 
 Options:
   --port <n>           Port for the dashboard server (default: 4848)
+  --allowed-origins <origins>
+                       Comma-separated exact HTTPS origins allowed when the
+                       dashboard is exposed through a reverse proxy. Loopback
+                       origins are allowed by default. Can also be set with
+                       AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS.
+
+Ports must be integers from 1 to 65535. Every allowed origin must be valid.
+Unknown options, missing values, and malformed origins fail without starting
+the dashboard server.
 
 Global Options:
   --json               Output as JSON
@@ -3418,6 +3499,7 @@ Global Options:
 Examples:
   agent-browser dashboard start
   agent-browser dashboard start --port 8080
+  agent-browser dashboard start --allowed-origins https://dashboard.example.com
   agent-browser dashboard stop
 "##
         }
@@ -3440,6 +3522,7 @@ Supported URL formats:
   - Port number: 9222 (connects to http://localhost:9222)
   - WebSocket URL: ws://localhost:9222/devtools/browser/...
   - Remote service: wss://remote-browser.example.com/cdp?token=...
+  - Root endpoint: wss://remote-browser.example.com?token=... (slash optional)
 
 Global Options:
   --json               Output as JSON
@@ -3479,6 +3562,9 @@ available localhost port automatically and reports it back.
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
+  - On Chrome, URL messages follow full-document, History API, and fragment
+    navigation in the active tab's main frame. Child-frame and background-tab
+    navigation does not emit URL messages.
   - Frames are delivered latest-first: the newest frame is picked at send
     time, so frames produced during an in-flight write are skipped, never
     queued. Input events dispatch immediately, independent of frame
@@ -3848,6 +3934,7 @@ Examples:
   agent-browser skills list
   agent-browser skills get core
   agent-browser skills get core --full
+  agent-browser skills get protected-vercel-deployments
   agent-browser skills get electron --full
   agent-browser skills get --all
   agent-browser skills path core
@@ -3940,7 +4027,8 @@ Start here (for AI agents):
   Skills ship with the CLI (always version-matched) and include workflow
   patterns, ref/selector usage, and copy-paste examples. Prefer this over
   guessing commands from flag docs alone. Specialized skills cover Electron
-  apps, Slack, exploratory testing, and cloud browser providers.
+  apps, Slack, exploratory testing, protected Vercel deployments, and cloud
+  browser providers.
 
   skills [list]                List available skills
   skills get core              Core usage guide (overview + common patterns)
@@ -4038,6 +4126,13 @@ Streaming:
   stream disable             Stop runtime WebSocket streaming
   stream status              Show streaming status and active port
 
+WebMCP (experimental):
+  webmcp list                List tools registered by the current page
+  webmcp invoke <tool>       Invoke a page tool; accepts --params <json|@file>,
+                             --frame <frame-id>, --detach, and --timeout <ms>
+  webmcp result <id>         Wait for a detached invocation result
+  webmcp cancel <id>         Cancel an active invocation
+
 React (requires `open --enable react-devtools`):
   react tree                 Full React component tree (depth id parent name columns)
   react inspect <id>         Inspect one fiber (props, hooks, state, source)
@@ -4105,6 +4200,8 @@ Chat (AI):
 Dashboard:
   dashboard [start]          Start the dashboard server (default port: 4848)
   dashboard start --port <n> Start on a specific port
+  dashboard start --allowed-origins <origins>
+                            Allow exact HTTPS reverse-proxied origins
   dashboard stop             Stop the dashboard server
 
 Setup:
@@ -4166,6 +4263,9 @@ Options:
   --proxy-bypass <hosts>     Bypass proxy for these hosts (or AGENT_BROWSER_PROXY_BYPASS, NO_PROXY)
                              e.g., --proxy-bypass "localhost,*.internal.com"
   --ignore-https-errors      Ignore HTTPS certificate errors
+  --ca-cert <path>           Trust a specific CA certificate for HTTPS interception proxies
+                             (or AGENT_BROWSER_CA_CERT; local Chromium on Linux; install --with-deps provides certutil)
+  --no-ca-cert               Clear CA trust retained by the running browser session
   --allow-file-access        Allow file:// URLs to access local files (Chromium only)
   --hide-scrollbars <bool>   Hide native scrollbars in headless Chromium screenshots (default: true)
                              Use --hide-scrollbars false to keep scrollbars visible
@@ -4178,7 +4278,9 @@ Options:
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
-  --cdp <port>               Connect via CDP (Chrome DevTools Protocol)
+  --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
+                             (or AGENT_BROWSER_NO_WEBMCP env)
+  --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)
                              Commands fail with a tab_gone error instead of falling back
                              to another tab when the bound tab is closed. JSON includes
@@ -4253,6 +4355,8 @@ Environment:
   AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend
   AGENT_BROWSER_DEBUG            Debug output
   AGENT_BROWSER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
+  AGENT_BROWSER_CA_CERT          Path to CA certificate to trust (HTTPS interception proxies)
+  AGENT_BROWSER_CLEAR_CA_CERT    Clear CA trust retained by the running browser session
   AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name)
   AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
   AGENT_BROWSER_PIN_TAB          Pin the session to its bound tab (strict tab binding)
@@ -4268,6 +4372,8 @@ Environment:
   AGENT_BROWSER_STREAM_QUALITY   JPEG quality 0-100 (default: 80)
   AGENT_BROWSER_STREAM_MAX_WIDTH  Cap frame width in pixels (default: the viewport)
   AGENT_BROWSER_STREAM_MAX_HEIGHT Cap frame height in pixels (default: the viewport)
+  AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS
+                                 Comma-separated exact HTTPS origins allowed for a reverse-proxied dashboard
   AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (default: 3600000 = 1h; 0 disables)
                                  Dashboard input resets the timer; headed, Safari/iOS WebDriver, and user-attached browsers are exempt from the default
                                  Provider-owned cloud browsers remain eligible for default cleanup
@@ -4425,7 +4531,7 @@ pub fn print_version() {
 mod tests {
     use super::{
         boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
-        format_with_boundaries, OutputOptions,
+        format_webmcp_text, format_webmcp_tool_text, format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
@@ -4675,5 +4781,60 @@ hydration: -  phases: 0  hydratedComponents: 0"
             boundary_origin(&json!({ "url": "https://example.com/source" })),
             Some("https://example.com/source")
         );
+    }
+
+    #[test]
+    fn test_webmcp_text_can_use_content_boundaries() {
+        let data = json!({
+            "invocationId": "i1",
+            "status": "completed",
+            "origin": "https://example.com",
+            "output": {"message": "untrusted"}
+        });
+        let text = format_webmcp_text(Some("webmcp_invoke"), &data).unwrap();
+        let rendered = format_with_boundaries(
+            &text,
+            boundary_origin(&data),
+            &OutputOptions {
+                content_boundaries: true,
+                ..OutputOptions::default()
+            },
+        );
+        assert!(rendered.contains("origin=https://example.com"));
+        assert!(rendered.contains("\"message\": \"untrusted\""));
+    }
+
+    #[test]
+    fn test_webmcp_list_tools_keep_their_own_origin() {
+        let first = json!({
+            "name": "search",
+            "frameId": "frame-a",
+            "origin": "https://a.example",
+            "description": "Search A"
+        });
+        let second = json!({
+            "name": "search",
+            "frameId": "frame-b",
+            "origin": "https://b.example",
+            "description": "Search B"
+        });
+        let opts = OutputOptions {
+            content_boundaries: true,
+            ..OutputOptions::default()
+        };
+        let first = format_with_boundaries(
+            &format_webmcp_tool_text(&first),
+            boundary_origin(&first),
+            &opts,
+        );
+        let second = format_with_boundaries(
+            &format_webmcp_tool_text(&second),
+            boundary_origin(&second),
+            &opts,
+        );
+        assert!(first.contains("origin=https://a.example"));
+        assert!(!first.contains("origin=https://b.example"));
+        assert!(second.contains("origin=https://b.example"));
+        assert!(!second.contains("origin=https://a.example"));
     }
 }
