@@ -1,1 +1,1 @@
-export const AGENT_BROWSER_SANDBOX_VERSION = "0.34.0-divebell.4";
+export const AGENT_BROWSER_SANDBOX_VERSION = "0.36.0-divebell.1";

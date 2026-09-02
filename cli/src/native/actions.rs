@@ -15,7 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
-use super::cdp::chrome::LaunchOptions;
+use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
@@ -329,9 +329,11 @@ fn launch_hash(
     opts.proxy_username.hash(&mut h);
     opts.proxy_password.hash(&mut h);
     opts.user_agent.hash(&mut h);
+    opts.ca_cert_digest.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
     opts.webgpu.hash(&mut h);
+    opts.webmcp.hash(&mut h);
     opts.no_xvfb.hash(&mut h);
     opts.restrict_webrtc.hash(&mut h);
     allowed_domains.hash(&mut h);
@@ -369,6 +371,84 @@ fn launch_connection_is_external(
     provider_name: Option<&str>,
 ) -> bool {
     launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
+}
+
+fn validate_ca_cert_launch_mode(
+    options: &LaunchOptions,
+    engine: Option<&str>,
+    external_launch: bool,
+) -> Result<(), String> {
+    if options.ca_cert.is_none() {
+        return Ok(());
+    }
+    if external_launch {
+        return Err(
+            "CA trust is active for this session and requires a locally launched Chromium browser on Linux. Pass --no-ca-cert to clear it before using CDP, auto-connect, or a provider."
+                .to_string(),
+        );
+    }
+    if engine.is_some_and(|value| !value.eq_ignore_ascii_case("chrome")) {
+        return Err("--ca-cert is supported only with the Chrome engine on Linux".to_string());
+    }
+    if options.ignore_https_errors {
+        return Err("--ca-cert cannot be combined with --ignore-https-errors".to_string());
+    }
+    super::browser::validate_launch_options(
+        options.extensions.as_deref(),
+        false,
+        options.profile.as_deref(),
+        options.storage_state.as_deref(),
+        options.allow_file_access,
+        options.executable_path.as_deref(),
+        options.ca_cert.as_deref(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveCaCert {
+    path: String,
+    bundle: crate::ca_bundle::CaBundle,
+}
+
+fn resolve_effective_ca_cert(
+    cmd: &Value,
+    state: &DaemonState,
+) -> Result<Option<EffectiveCaCert>, String> {
+    let requested_path = cmd.get("caCert").and_then(Value::as_str);
+    let clear = cmd
+        .get("clearCaCert")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if requested_path.is_some() && clear {
+        return Err("Cannot use --ca-cert with --no-ca-cert".to_string());
+    }
+    if clear {
+        return Ok(None);
+    }
+    let Some(path) = requested_path else {
+        return Ok(state.effective_ca_cert.clone());
+    };
+    let bundle = crate::ca_bundle::load(path)?;
+    if state
+        .effective_ca_cert
+        .as_ref()
+        .is_some_and(|current| current.bundle.digest() == bundle.digest())
+    {
+        return Ok(state.effective_ca_cert.clone());
+    }
+    Ok(Some(EffectiveCaCert {
+        path: path.to_string(),
+        bundle,
+    }))
+}
+
+fn apply_effective_ca_cert(
+    options: &mut LaunchOptions,
+    effective_ca_cert: &Option<EffectiveCaCert>,
+) {
+    options.ca_cert = effective_ca_cert.as_ref().map(|ca| ca.path.clone());
+    options.ca_bundle = effective_ca_cert.as_ref().map(|ca| ca.bundle.clone());
+    options.ca_cert_digest = effective_ca_cert.as_ref().map(|ca| *ca.bundle.digest());
 }
 
 pub struct DaemonState {
@@ -425,6 +505,7 @@ pub struct DaemonState {
     pub debugger: Arc<DebuggerController>,
     pub recording_state: RecordingState,
     event_rx: Option<broadcast::Receiver<CdpEvent>>,
+    pub webmcp: webmcp::RuntimeState,
     pub screencasting: bool,
     pub policy: Option<ActionPolicy>,
     pub pending_confirmation: Option<PendingConfirmation>,
@@ -481,6 +562,7 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    effective_ca_cert: Option<EffectiveCaCert>,
     /// Caller-supplied launch options used to create the current browser before
     /// launch-mutator plugins are applied. Partial follow-up launch requests
     /// inherit omitted values from this configuration so a read-only command
@@ -608,6 +690,7 @@ impl DaemonState {
             debugger: Arc::new(DebuggerController::new()),
             recording_state: RecordingState::new(),
             event_rx: None,
+            webmcp: webmcp::RuntimeState::default(),
             screencasting: false,
             policy: ActionPolicy::load_if_exists(),
             pending_confirmation: None,
@@ -638,6 +721,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            effective_ca_cert: None,
             active_launch_options: None,
             active_enable_features: Vec::new(),
             active_init_script_paths: Vec::new(),
@@ -968,22 +1052,21 @@ impl DaemonState {
                 .browser
                 .as_ref()
                 .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
-            server.set_cdp_session_id(session_id).await;
-
-            // Broadcast connection status change to WebSocket clients
             let connected = self.browser.is_some();
             let sc = server.is_screencasting().await;
             let (vw, vh) = server.viewport().await;
+            if let Some(ref mgr) = self.browser {
+                server
+                    .bind_cdp_session_and_broadcast_tabs(session_id, &mgr.tab_list())
+                    .await;
+            } else {
+                server
+                    .bind_cdp_session_and_broadcast_tabs(session_id, &[])
+                    .await;
+            }
             server
                 .broadcast_status(connected, sc, vw, vh, &self.engine)
                 .await;
-            if let Some(ref mgr) = self.browser {
-                server.broadcast_tabs(&mgr.tab_list()).await;
-            } else {
-                server.broadcast_tabs(&[]).await;
-            }
-            // Notify the background CDP event loop that the client changed
-            server.notify_client_changed();
         }
     }
 
@@ -1475,6 +1558,25 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetDestroyedEvent>(event.params.clone())
                             {
+                                let destroyed_active_target = self
+                                    .browser
+                                    .as_ref()
+                                    .and_then(|browser| browser.active_target_id().ok())
+                                    == Some(te.target_id.as_str());
+                                if let Some(session_id) = self
+                                    .browser
+                                    .as_ref()
+                                    .and_then(|browser| {
+                                        browser.session_id_for_target(&te.target_id)
+                                    })
+                                    .map(ToString::to_string)
+                                {
+                                    if destroyed_active_target {
+                                        self.webmcp.clear_page_scope(&session_id);
+                                    } else {
+                                        self.webmcp.clear_page_tools(&session_id);
+                                    }
+                                }
                                 destroyed_targets.push(te.target_id);
                             }
                             continue;
@@ -1513,6 +1615,19 @@ impl DaemonState {
                             if let Some(sid) =
                                 event.params.get("sessionId").and_then(|v| v.as_str())
                             {
+                                if let Some(frame_id) =
+                                    self.iframe_sessions
+                                        .iter()
+                                        .find_map(|(frame_id, known_sid)| {
+                                            (known_sid == sid).then(|| frame_id.clone())
+                                        })
+                                {
+                                    if let Some(ref browser) = self.browser {
+                                        if let Ok(session_id) = browser.active_session_id() {
+                                            self.webmcp.clear_frame_scope(session_id, &frame_id);
+                                        }
+                                    }
+                                }
                                 detached_iframe_sessions.push(sid.to_string());
                             }
                             continue;
@@ -1536,11 +1651,69 @@ impl DaemonState {
                             &self.active_iframe_sessions,
                         );
 
-                    if !session_matches && !iframe_network_event {
+                    let webmcp_event = event.session_id.as_deref().is_some_and(|sid| {
+                        (matches!(
+                            event.method.as_str(),
+                            "WebMCP.toolsAdded"
+                                | "WebMCP.toolsRemoved"
+                                | "Page.frameNavigated"
+                                | "Page.frameDetached"
+                        ) && self
+                            .browser
+                            .as_ref()
+                            .is_some_and(|browser| browser.has_page_session(sid)))
+                            || (event.method == "WebMCP.toolResponded"
+                                && (session_matches
+                                    || self.active_iframe_sessions.contains(sid)
+                                    || self.iframe_sessions.values().any(|known| known == sid)))
+                    });
+
+                    if !session_matches && !iframe_network_event && !webmcp_event {
                         continue;
                     }
 
                     match event.method.as_str() {
+                        "WebMCP.toolsAdded" => {
+                            if let Some(session_id) = event.session_id.as_deref() {
+                                self.webmcp
+                                    .apply_tools_added(session_id, &event.params, "null");
+                            }
+                        }
+                        "WebMCP.toolsRemoved" => {
+                            if let Some(session_id) = event.session_id.as_deref() {
+                                self.webmcp.apply_tools_removed(session_id, &event.params);
+                            }
+                        }
+                        "WebMCP.toolResponded" => {
+                            self.webmcp.apply_response(event.params.clone());
+                        }
+                        "Page.frameNavigated" => {
+                            if let Some(frame) = event.params.get("frame") {
+                                let session_id = event.session_id.as_deref().unwrap_or_default();
+                                if frame.get("parentId").is_none() {
+                                    if session_matches {
+                                        self.webmcp.clear_page_scope(session_id);
+                                    } else {
+                                        self.webmcp.clear_page_tools(session_id);
+                                    }
+                                }
+                                if let (Some(frame_id), Some(origin)) = (
+                                    frame.get("id").and_then(Value::as_str),
+                                    webmcp::frame_origin(frame),
+                                ) {
+                                    self.webmcp
+                                        .update_frame_origin(session_id, frame_id, &origin);
+                                }
+                            }
+                        }
+                        "Page.frameDetached" => {
+                            if let Some(frame_id) =
+                                event.params.get("frameId").and_then(Value::as_str)
+                            {
+                                let session_id = event.session_id.as_deref().unwrap_or_default();
+                                self.webmcp.clear_frame_scope(session_id, frame_id);
+                            }
+                        }
                         "Runtime.consoleAPICalled" => {
                             let level = event
                                 .params
@@ -2201,6 +2374,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
     state.active_iframe_sessions.clear();
+    state.webmcp.clear_all();
     state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
@@ -2293,6 +2467,8 @@ fn skip_launch_action(action: &str) -> bool {
             | "stream_disable"
             | "stream_status"
             | "session_info"
+            | "webmcp_result"
+            | "webmcp_cancel"
             | "memory_status"
             | "memory_sampling_stop"
             | "memory_cancel"
@@ -2588,7 +2764,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 let _ = close_current_browser(state).await;
             }
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
-                return error_response(&id, &format!("Auto-launch failed: {}", e));
+                let context = auto_launch_error_context(env::var("AGENT_BROWSER_CDP").is_ok());
+                return error_response(&id, &format!("{}: {}", context, e));
             }
             mark_browser_launched_for_restore_save(state);
             lifecycle_launched = true;
@@ -2758,8 +2935,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "coverage_take" => handle_coverage_take(cmd, state).await,
         "coverage_stop" => handle_coverage_stop(cmd, state).await,
         "coverage_cancel" => handle_coverage_cancel(state).await,
-        "webmcp_list" => handle_webmcp_list(state).await,
-        "webmcp_call" => handle_webmcp_call(cmd, state).await,
         "recording_start" => handle_recording_start(cmd, state).await,
         "recording_stop" => handle_recording_stop(state).await,
         "recording_restart" => handle_recording_restart(cmd, state).await,
@@ -2821,6 +2996,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "stream_enable" => handle_stream_enable(cmd, state).await,
         "stream_disable" => handle_stream_disable(state).await,
         "stream_status" => handle_stream_status(state).await,
+        "webmcp_list" => handle_webmcp_list(state).await,
+        "webmcp_invoke" => handle_webmcp_invoke(cmd, state).await,
+        "webmcp_result" => handle_webmcp_result(cmd, state).await,
+        "webmcp_cancel" => handle_webmcp_cancel(cmd, state).await,
         "waitforurl" => handle_waitforurl(cmd, state).await,
         "waitforloadstate" => handle_waitforloadstate(cmd, state).await,
         "waitforfunction" => handle_waitforfunction(cmd, state).await,
@@ -2910,8 +3089,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 memory::with_api_version(data)
             } else if action.starts_with("coverage_") {
                 coverage::with_api_version(data)
-            } else if action.starts_with("webmcp_") {
-                webmcp::with_api_version(data)
             } else {
                 data
             },
@@ -2925,10 +3102,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             } else if action.starts_with("coverage_") {
                 if let Some(object) = response.as_object_mut() {
                     object.insert("errorCode".to_string(), json!(coverage::error_code(&e)));
-                }
-            } else if action.starts_with("webmcp_") {
-                if let Some(object) = response.as_object_mut() {
-                    object.insert("errorCode".to_string(), json!(webmcp::error_code(&e)));
                 }
             }
             response
@@ -3001,22 +3174,23 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         server.broadcast_result(&id, action, success, &data, duration_ms);
 
         if let Some(ref mgr) = state.browser {
-            server.broadcast_tabs(&mgr.tab_list()).await;
-
-            // Keep the stream server's CDP session in sync with the active tab
-            // so screencasting always targets the correct page.
-            if matches!(
-                action,
-                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
-            ) {
-                let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
-                server.set_cdp_session_id(session_id).await;
-                server.notify_client_changed();
-            }
+            let tabs = mgr.tab_list();
+            let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
+            server
+                .bind_cdp_session_and_broadcast_tabs(session_id, &tabs)
+                .await;
         }
     }
 
     resp
+}
+
+fn auto_launch_error_context(has_cdp: bool) -> &'static str {
+    if has_cdp {
+        "CDP connection failed"
+    } else {
+        "Auto-launch failed"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3601,6 +3775,8 @@ async fn auto_launch(
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
     let mut options = launch_options_from_env();
+    let effective_ca_cert = state.effective_ca_cert.clone();
+    apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
 
     // Use the stream server's viewport dimensions for --window-size so the
@@ -3609,6 +3785,14 @@ async fn auto_launch(
         options.viewport_size = Some(server.viewport().await);
     }
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
+    let cdp = env::var("AGENT_BROWSER_CDP").ok();
+    let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
+    let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
+    validate_ca_cert_launch_mode(
+        &options,
+        engine.as_deref(),
+        cdp.is_some() || auto_connect || provider.is_some(),
+    )?;
     let enable_features = launch_enable_features_from_env();
     let init_script_paths = launch_init_script_paths_from_env();
     let allowed_domains = current_allowed_domains(state).await;
@@ -3635,7 +3819,7 @@ async fn auto_launch(
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file(&state.session_id);
 
-    if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
+    if let Some(cdp) = cdp {
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
             cdp_url: Some(cdp.as_str()),
@@ -3674,7 +3858,7 @@ async fn auto_launch(
         return Ok(());
     }
 
-    if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
+    if auto_connect {
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
             cdp_url: None,
@@ -3721,7 +3905,7 @@ async fn auto_launch(
     // provider API instead of launching a local Chrome instance.  This mirrors
     // the logic in handle_launch() so that auto_launch (triggered by any
     // command arriving before an explicit "launch") honours the provider env.
-    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+    if let Some(provider) = provider {
         let p = provider.to_lowercase();
         ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
             allowed_domains: &allowed_domains,
@@ -3806,6 +3990,7 @@ async fn auto_launch(
     })?;
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
+    validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
         cdp_url: None,
@@ -3828,10 +4013,14 @@ async fn auto_launch(
         "local",
         None,
     );
+    if let Some(ref ca) = effective_ca_cert {
+        options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
+    }
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
     state.launch_hash = Some(hash);
+    state.effective_ca_cert = effective_ca_cert;
     state.active_launch_options = Some(requested_launch_options);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
@@ -4019,12 +4208,20 @@ fn launch_options_from_env() -> LaunchOptions {
         ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
+        ca_cert: None,
+        ca_bundle: None,
+        ca_cert_digest: None,
+        prepared_nss_home: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
         viewport_size: None,
         use_real_keychain: false,
         webgpu: webgpu_from_env(),
+        webmcp: !matches!(
+            env::var("AGENT_BROWSER_NO_WEBMCP").as_deref(),
+            Ok("1" | "true" | "yes")
+        ),
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
@@ -4411,6 +4608,7 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 // ---------------------------------------------------------------------------
 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // A launch envelope is a partial update. Start with the active browser's
     // requested launch configuration, or the daemon's spawn-time environment
     // before the first browser exists, and only replace fields present in the
@@ -4572,6 +4770,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("ignoreHTTPSErrors")
             .and_then(|v| v.as_bool())
             .unwrap_or(active_launch_options.ignore_https_errors),
+        ca_cert: None,
+        ca_bundle: None,
+        ca_cert_digest: None,
+        prepared_nss_home: None,
         color_scheme: if cmd.get("colorScheme").is_some() {
             cmd.get("colorScheme")
                 .and_then(|v| v.as_str())
@@ -4596,12 +4798,21 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("webgpu")
             .and_then(|v| v.as_bool())
             .unwrap_or(active_launch_options.webgpu),
+        webmcp: cmd
+            .get("webmcp")
+            .and_then(Value::as_bool)
+            .unwrap_or(active_launch_options.webmcp),
         no_xvfb: cmd
             .get("noXvfb")
             .and_then(|v| v.as_bool())
             .unwrap_or(active_launch_options.no_xvfb),
         restrict_webrtc,
     };
+    apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
+
+    let external_launch =
+        cdp_url.is_some() || cdp_port.is_some() || auto_connect || provider_name.is_some();
+    validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), external_launch)?;
 
     let requested_launch_options = launch_options.clone();
 
@@ -4611,6 +4822,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if local_launch {
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
+        validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
     }
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -4668,12 +4880,18 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.browser.is_some() || state.active_provider_session.is_some();
 
     if needs_relaunch {
+        if local_launch {
+            if let Some(ref ca) = effective_ca_cert {
+                launch_options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
+            }
+        }
         if had_browser_before_launch {
             let _ = auto_save_restore_state(state).await;
             close_current_browser(state).await?;
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         state.active_launch_options = Some(requested_launch_options.clone());
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
@@ -4687,6 +4905,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         storage_state,
         launch_options.allow_file_access,
         launch_options.executable_path.as_deref(),
+        launch_options.ca_cert.as_deref(),
     )?;
 
     // Store proxy credentials before any local or remote CDP branch enables
@@ -4714,6 +4933,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
@@ -4731,6 +4951,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
@@ -4753,13 +4974,26 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+        state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
     }
 
     if let Some(provider) = provider_name {
         match provider.to_lowercase().as_str() {
-            "ios" => return launch_ios(cmd, state).await,
-            "safari" => return launch_safari(cmd, state).await,
+            "ios" => {
+                let result = launch_ios(cmd, state).await;
+                if result.is_ok() {
+                    state.effective_ca_cert = effective_ca_cert;
+                }
+                return result;
+            }
+            "safari" => {
+                let result = launch_safari(cmd, state).await;
+                if result.is_ok() {
+                    state.effective_ca_cert = effective_ca_cert;
+                }
+                return result;
+            }
             _ => {
                 let command_plugins = plugins_from_command_or_env(cmd);
                 let conn = providers::connect_provider_with_plugins_and_options(
@@ -4811,6 +5045,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                             .await;
                         try_auto_restore_state(state).await;
                         load_storage_state_or_rollback(state, &storage_state_owned).await?;
+                        state.effective_ca_cert = effective_ca_cert;
 
                         if let Some(info) = providers::get_agentcore_info() {
                             return Ok(json!({
@@ -4872,6 +5107,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // origin navigations go through the same domain and proxy handling as
     // normal browser traffic. Explicit storage state wins over auto-restore.
     load_storage_state_or_rollback(state, &storage_state_owned).await?;
+    state.effective_ca_cert = effective_ca_cert;
 
     Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }))
 }
@@ -4982,6 +5218,18 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             filter.check_url(url)?;
         }
     }
+
+    if let Some(session_id) = state
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.active_session_id().ok())
+        .map(ToString::to_string)
+    {
+        state.webmcp.clear_page_scope(&session_id);
+    } else {
+        state.webmcp.clear_invocations();
+    }
+    let _ = enable_webmcp_events(state).await;
 
     // WebDriver backend path
     if let Some(ref wb) = state.webdriver_backend {
@@ -6467,11 +6715,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         selector,
         ..SnapshotOptions::default()
     };
+    // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
+    // Build the replacement separately so a failed diff leaves the existing refs usable.
+    let mut current_ref_map = RefMap::new();
     let current = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut current_ref_map,
         state.active_frame_id.as_deref(),
         &state.iframe_sessions,
     )
@@ -6481,13 +6732,23 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
 
     let baseline_text = match baseline {
         Some(b) if std::path::Path::new(b).exists() => {
-            std::fs::read_to_string(b).map_err(|e| format!("Failed to read baseline: {}", e))?
+            let mut contents = std::fs::read_to_string(b)
+                .map_err(|e| format!("Failed to read baseline: {}", e))?;
+            // Plain CLI output ends with one newline when redirected to a baseline file.
+            if contents.ends_with('\n') {
+                contents.pop();
+                if contents.ends_with('\r') {
+                    contents.pop();
+                }
+            }
+            contents
         }
         Some(b) => b.to_string(),
         None => String::new(),
     };
 
     let result = diff::diff_snapshots(&baseline_text, &current);
+    state.ref_map = current_ref_map;
     Ok(json!({
         "diff": result.diff,
         "additions": result.additions,
@@ -6515,34 +6776,40 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .map(WaitUntil::from_str)
         .unwrap_or(WaitUntil::Load);
 
+    // Each navigation can replace the document, so invalidate refs before it starts.
+    state.ref_map.clear();
+
     // Navigate to URL1 and snapshot
     mgr.navigate(url1, wait_until).await?;
     let session_id = mgr.active_session_id()?.to_string();
     let options = SnapshotOptions::default();
+    let mut snap1_ref_map = RefMap::new();
     let snap1 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut snap1_ref_map,
         None,
         &state.iframe_sessions,
     )
     .await?;
 
     // Navigate to URL2 and snapshot
-    mgr.navigate(url2, wait_until).await?;
     state.ref_map.clear();
+    mgr.navigate(url2, wait_until).await?;
+    let mut snap2_ref_map = RefMap::new();
     let snap2 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut snap2_ref_map,
         None,
         &state.iframe_sessions,
     )
     .await?;
 
     let result = diff::diff_text(&snap1, &snap2);
+    state.ref_map = snap2_ref_map;
     Ok(json!({
         "diff": result,
         "url1": url1,
@@ -6705,6 +6972,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
+    state.webmcp.clear_invocations();
     let mut result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_new(if defer_url_until_controls { None } else { url }, label)
@@ -6765,6 +7033,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
+    state.webmcp.clear_invocations();
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     install_network_controls_or_close(state, has_proxy_creds).await?;
@@ -6827,6 +7096,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     // index) must not wipe the caller's refs and frame scope.
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
+    state.webmcp.clear_invocations();
     state.active_frame_id = None;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
@@ -7260,40 +7530,6 @@ async fn handle_coverage_cancel(state: &DaemonState) -> Result<Value, String> {
             "targetId": capture.target_id,
         }))
     }
-}
-
-fn ensure_webmcp_supported(state: &DaemonState) -> Result<(), String> {
-    if !matches!(state.backend_type, BackendType::Cdp) || state.engine != "chrome" {
-        return Err(webmcp::unsupported(format!(
-            "WebMCP is only supported with the Chrome CDP engine; current engine is {}",
-            state.engine
-        )));
-    }
-    Ok(())
-}
-
-async fn handle_webmcp_list(state: &DaemonState) -> Result<Value, String> {
-    ensure_webmcp_supported(state)?;
-    let manager = state.browser.as_ref().ok_or("Browser not launched")?;
-    webmcp::list(manager).await
-}
-
-async fn handle_webmcp_call(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
-    ensure_webmcp_supported(state)?;
-    let manager = state.browser.as_ref().ok_or("Browser not launched")?;
-    let tool_name = cmd
-        .get("toolName")
-        .and_then(Value::as_str)
-        .ok_or("Missing 'toolName' parameter")?;
-    let input = cmd.get("input").cloned().unwrap_or_else(|| json!({}));
-    webmcp::call(
-        manager,
-        tool_name,
-        input,
-        cmd.get("frameId").and_then(Value::as_str),
-        cmd.get("timeout").and_then(Value::as_u64),
-    )
-    .await
 }
 
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -8681,6 +8917,249 @@ async fn handle_stream_disable(state: &mut DaemonState) -> Result<Value, String>
 
 async fn handle_stream_status(state: &DaemonState) -> Result<Value, String> {
     Ok(current_stream_status(state).await)
+}
+
+async fn webmcp_page_context(
+    state: &DaemonState,
+) -> Result<(Arc<CdpClient>, String, String), String> {
+    if matches!(state.backend_type, BackendType::WebDriver) || state.engine != "chrome" {
+        return Err(webmcp::unsupported_error(&format!(
+            "active backend is {}",
+            state.engine
+        )));
+    }
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = browser.active_session_id()?.to_string();
+    let url = browser.get_url().await?;
+    {
+        let filter = state.domain_filter.read().await;
+        if let Some(filter) = filter.as_ref() {
+            filter.check_url(&url)?;
+        }
+    }
+    let origin = url::Url::parse(&url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or(url);
+    Ok((browser.client.clone(), session_id, origin))
+}
+
+async fn collect_webmcp_tools(state: &mut DaemonState) -> Result<Vec<webmcp::ToolRecord>, String> {
+    state.drain_cdp_events_background().await?;
+    let (client, session_id, origin) = webmcp_page_context(state).await?;
+    let mut rx = client.subscribe();
+    fn collect_origins(tree: &Value, origins: &mut HashMap<String, String>) {
+        if let Some(frame) = tree.get("frame") {
+            if let (Some(frame_id), Some(origin)) = (
+                frame.get("id").and_then(Value::as_str),
+                webmcp::frame_origin(frame),
+            ) {
+                origins.insert(frame_id.to_string(), origin);
+            }
+        }
+        if let Some(children) = tree.get("childFrames").and_then(Value::as_array) {
+            for child in children {
+                collect_origins(child, origins);
+            }
+        }
+    }
+    let mut frame_origins = HashMap::new();
+    let frame_tree = client
+        .send_command_no_params("Page.getFrameTree", Some(&session_id))
+        .await
+        .unwrap_or_else(|_| json!({}));
+    if let Some(tree) = frame_tree.get("frameTree") {
+        collect_origins(tree, &mut frame_origins);
+    }
+    for (frame_id, frame_origin) in &frame_origins {
+        state
+            .webmcp
+            .update_frame_origin(&session_id, frame_id, frame_origin.as_str());
+    }
+    client
+        .send_command_no_params("WebMCP.enable", Some(&session_id))
+        .await
+        .map_err(|error| webmcp::unsupported_error(&error))?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(event))
+                if event.method == "WebMCP.toolsAdded"
+                    && event.session_id.as_deref() == Some(session_id.as_str()) =>
+            {
+                state
+                    .webmcp
+                    .apply_tools_added(&session_id, &event.params, &origin);
+            }
+            Ok(Ok(event))
+                if event.method == "WebMCP.toolsRemoved"
+                    && event.session_id.as_deref() == Some(session_id.as_str()) =>
+            {
+                state.webmcp.apply_tools_removed(&session_id, &event.params);
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
+        }
+    }
+    let tools = state.webmcp.tools(&session_id)?;
+    let domain_filter = state.domain_filter.read().await.clone();
+    if let Some(filter) = domain_filter.as_ref() {
+        for tool in &tools {
+            filter.check_url(&tool.origin)?;
+        }
+    }
+    Ok(tools)
+}
+
+async fn enable_webmcp_events(state: &DaemonState) -> Result<(), String> {
+    let (client, session_id, _) = webmcp_page_context(state).await?;
+    client
+        .send_command_no_params("WebMCP.enable", Some(&session_id))
+        .await
+        .map(|_| ())
+        .map_err(|error| webmcp::unsupported_error(&error))
+}
+
+async fn handle_webmcp_list(state: &mut DaemonState) -> Result<Value, String> {
+    let tools = collect_webmcp_tools(state).await?;
+    Ok(json!({
+        "experimental": true,
+        "tools": tools,
+    }))
+}
+
+async fn wait_for_webmcp_invocation(
+    state: &mut DaemonState,
+    invocation_id: &str,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let deadline = tokio::time::Instant::now() + webmcp::timeout_duration(timeout_ms);
+    loop {
+        state.drain_cdp_events_background().await?;
+        if let Some(record) = state.webmcp.invocations.get(invocation_id) {
+            if record.is_terminal() {
+                return Ok(record.to_json());
+            }
+        } else {
+            return Err(format!(
+                "{}: Unknown WebMCP invocation '{}'",
+                webmcp::ERR_INVOCATION_NOT_FOUND,
+                invocation_id
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Ok((client, session_id, _)) = webmcp_page_context(state).await {
+                let _ = client
+                    .send_command(
+                        "WebMCP.cancelInvocation",
+                        Some(json!({ "invocationId": invocation_id })),
+                        Some(&session_id),
+                    )
+                    .await;
+            }
+            if let Some(record) = state.webmcp.invocations.get_mut(invocation_id) {
+                record.mark_timed_out();
+                return Ok(record.to_json());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn handle_webmcp_invoke(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let tool_name = cmd
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'tool' parameter")?;
+    let input = cmd.get("params").cloned().unwrap_or_else(|| json!({}));
+    webmcp::validate_input(&input)?;
+    state.webmcp.ensure_capacity()?;
+    let frame_id = cmd.get("frameId").and_then(Value::as_str);
+    let tools = collect_webmcp_tools(state).await?;
+    let tool = webmcp::resolve_tool(&tools, tool_name, frame_id)?;
+    let (client, session_id, _) = webmcp_page_context(state).await?;
+    let result = client
+        .send_command(
+            "WebMCP.invokeTool",
+            Some(json!({
+                "frameId": tool.frame_id,
+                "toolName": tool.name,
+                "input": input,
+            })),
+            Some(&session_id),
+        )
+        .await
+        .map_err(|error| webmcp::invoke_error(&error))?;
+    let invocation_id = result
+        .get("invocationId")
+        .and_then(Value::as_str)
+        .ok_or("WebMCP.invokeTool response is missing invocationId")?
+        .to_string();
+    state.webmcp.insert(webmcp::InvocationRecord::pending(
+        invocation_id.clone(),
+        tool.name,
+        tool.frame_id,
+        tool.origin,
+    ))?;
+
+    if cmd.get("detach").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(state.webmcp.invocations[&invocation_id].to_json());
+    }
+    wait_for_webmcp_invocation(state, &invocation_id, state.timeout_ms(cmd)).await
+}
+
+async fn handle_webmcp_result(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let invocation_id = cmd
+        .get("invocationId")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'invocationId' parameter")?;
+    wait_for_webmcp_invocation(state, invocation_id, state.timeout_ms(cmd)).await
+}
+
+async fn handle_webmcp_cancel(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let invocation_id = cmd
+        .get("invocationId")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'invocationId' parameter")?;
+    state.drain_cdp_events_background().await?;
+    let record = state.webmcp.invocations.get(invocation_id).ok_or_else(|| {
+        format!(
+            "{}: Unknown WebMCP invocation '{}'",
+            webmcp::ERR_INVOCATION_NOT_FOUND,
+            invocation_id
+        )
+    })?;
+    if record.is_terminal() {
+        return Err(format!(
+            "{}: WebMCP invocation '{}' is already {}",
+            webmcp::ERR_INVOCATION_NOT_ACTIVE,
+            invocation_id,
+            record.status
+        ));
+    }
+    let (client, session_id, _) = webmcp_page_context(state).await?;
+    if let Err(error) = client
+        .send_command(
+            "WebMCP.cancelInvocation",
+            Some(json!({ "invocationId": invocation_id })),
+            Some(&session_id),
+        )
+        .await
+    {
+        state.drain_cdp_events_background().await?;
+        if let Some(record) = state.webmcp.invocations.get(invocation_id) {
+            if record.is_terminal() {
+                return Ok(record.to_json());
+            }
+        }
+        return Err(webmcp::cancel_error(&error));
+    }
+    wait_for_webmcp_invocation(state, invocation_id, state.timeout_ms(cmd)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -12102,6 +12581,10 @@ fn error_response(id: &str, error: &str) -> Value {
     // using --json can match on it instead of parsing the message.
     if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
+    } else if let Some((code, _)) = error.split_once(": ") {
+        if code.starts_with("webmcp_") {
+            resp["code"] = json!(code);
+        }
     }
     resp
 }
@@ -13306,6 +13789,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rejected_navigation_preserves_webmcp_invocations() {
+        let mut state = DaemonState::new();
+        state
+            .webmcp
+            .insert(webmcp::InvocationRecord::pending(
+                "pending-1".to_string(),
+                "pending-tool".to_string(),
+                "frame-1".to_string(),
+                "https://example.com".to_string(),
+            ))
+            .unwrap();
+        {
+            let mut df = state.domain_filter.write().await;
+            *df = Some(DomainFilter::new("example.com"));
+        }
+
+        let error = handle_navigate(
+            &json!({
+                "action": "navigate",
+                "url": "https://evil.example/private"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("evil.example"));
+        assert_eq!(state.webmcp.invocations["pending-1"].status, "pending");
+    }
+
+    #[tokio::test]
     async fn test_read_with_url_cannot_broaden_session_domain_filter() {
         let mut state = DaemonState::new();
         {
@@ -13880,6 +14394,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(resp["code"], "tab_gone");
     }
 
+    #[test]
+    fn test_webmcp_unsupported_error_is_actionable_and_machine_readable() {
+        let error = webmcp::unsupported_error("active backend is lightpanda");
+        let resp = error_response("cmd-webmcp", &error);
+        assert_eq!(resp["success"], false);
+        assert_eq!(resp["code"], webmcp::ERR_UNSUPPORTED);
+        assert!(error.contains("current agent-browser-managed Chrome"));
+        assert!(error.contains("without --no-webmcp"));
+        assert!(error.contains("active backend is lightpanda"));
+    }
+
     #[tokio::test]
     async fn test_daemon_state_new() {
         let guard = EnvGuard::new(&[
@@ -14108,6 +14633,138 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
             launch_hash(&webgpu, &[], &[], &[], &[], Some("chrome"), "local", None)
         );
+    }
+
+    #[test]
+    fn test_launch_hash_includes_ca_cert() {
+        let base = LaunchOptions::default();
+        let bundle = crate::ca_bundle::test_bundle(b"proxy-ca");
+        let trusted_ca = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ca_bundle: Some(bundle.clone()),
+            ca_cert_digest: Some(*bundle.digest()),
+            ..Default::default()
+        };
+        assert_ne!(
+            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(
+                &trusted_ca,
+                &[],
+                &[],
+                &[],
+                &[],
+                Some("chrome"),
+                "local",
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn test_effective_ca_cert_transitions_distinguish_omission_and_clear() {
+        let mut state = DaemonState::new();
+        state.effective_ca_cert = Some(EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"first"),
+        });
+
+        let omitted = resolve_effective_ca_cert(&json!({}), &state)
+            .unwrap()
+            .expect("omission should retain the effective CA");
+        assert_eq!(omitted.path, "/tmp/first.pem");
+
+        let cleared = resolve_effective_ca_cert(&json!({ "clearCaCert": true }), &state).unwrap();
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn test_provider_compatibility_uses_resolved_ca_cert_transition() {
+        let mut state = DaemonState::new();
+        state.effective_ca_cert = Some(EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"first"),
+        });
+
+        let retained = resolve_effective_ca_cert(&json!({}), &state).unwrap();
+        let mut retained_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut retained_options, &retained);
+        let error =
+            validate_ca_cert_launch_mode(&retained_options, Some("chrome"), true).unwrap_err();
+        assert!(error.contains("CA trust is active for this session"));
+        assert!(error.contains("--no-ca-cert"));
+
+        let cleared = resolve_effective_ca_cert(&json!({ "clearCaCert": true }), &state).unwrap();
+        let mut cleared_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut cleared_options, &cleared);
+        assert!(validate_ca_cert_launch_mode(&cleared_options, Some("chrome"), true).is_ok());
+    }
+
+    #[test]
+    fn test_launch_hash_uses_ca_content_not_path() {
+        let bundle = crate::ca_bundle::test_bundle(b"same");
+        let first = EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: bundle.clone(),
+        };
+        let second = EffectiveCaCert {
+            path: "/tmp/second.pem".to_string(),
+            bundle,
+        };
+        let changed = EffectiveCaCert {
+            path: "/tmp/first.pem".to_string(),
+            bundle: crate::ca_bundle::test_bundle(b"changed"),
+        };
+        let mut first_options = LaunchOptions::default();
+        let mut second_options = LaunchOptions::default();
+        let mut changed_options = LaunchOptions::default();
+        apply_effective_ca_cert(&mut first_options, &Some(first));
+        apply_effective_ca_cert(&mut second_options, &Some(second));
+        apply_effective_ca_cert(&mut changed_options, &Some(changed));
+
+        let hash = |options: &LaunchOptions| {
+            launch_hash(options, &[], &[], &[], &[], Some("chrome"), "local", None)
+        };
+        assert_eq!(hash(&first_options), hash(&second_options));
+        assert_ne!(hash(&first_options), hash(&changed_options));
+    }
+
+    #[test]
+    fn test_effective_ca_cert_rejects_set_and_clear_together() {
+        let state = DaemonState::new();
+        let error = resolve_effective_ca_cert(
+            &json!({
+                "caCert": "/tmp/proxy-ca.pem",
+                "clearCaCert": true
+            }),
+            &state,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Cannot use --ca-cert with --no-ca-cert"));
+    }
+
+    #[test]
+    fn test_daemon_rejects_ca_cert_outside_local_chrome() {
+        let ca = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&ca, Some("chrome"), true).is_err());
+        assert!(validate_ca_cert_launch_mode(&ca, Some("lightpanda"), false).is_err());
+
+        let ignored = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            ignore_https_errors: true,
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&ignored, Some("chrome"), false).is_err());
+
+        let profile = LaunchOptions {
+            ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
+            profile: Some("/tmp/profile".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_ca_cert_launch_mode(&profile, Some("chrome"), false).is_err());
     }
 
     #[test]
@@ -15249,6 +15906,28 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         );
     }
 
+    #[test]
+    fn test_auto_launch_error_context_distinguishes_cdp_connections() {
+        assert_eq!(auto_launch_error_context(true), "CDP connection failed");
+        assert_eq!(auto_launch_error_context(false), "Auto-launch failed");
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_reports_cdp_connection_context() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_CDP"]);
+        guard.set("AGENT_BROWSER_CDP", "invalid-cdp-target");
+        let mut state = DaemonState::new();
+        let cmd = json!({ "action": "snapshot", "id": "cdp-error-context" });
+
+        let result = execute_command(&cmd, &mut state).await;
+
+        assert_eq!(result["success"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("CDP connection failed: Invalid CDP target:"));
+    }
+
     #[tokio::test]
     async fn test_execute_empty_action() {
         let mut state = DaemonState::new();
@@ -15345,6 +16024,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_empty_state() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         let patterns = build_fetch_patterns(&state).await;
         assert!(
@@ -15355,6 +16036,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_with_routes() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut routes = state.routes.write().await;
@@ -15417,6 +16100,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_collapses_repeated_wildcards() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut routes = state.routes.write().await;

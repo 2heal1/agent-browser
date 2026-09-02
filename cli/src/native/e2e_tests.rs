@@ -36,16 +36,418 @@ fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
 }
 
+fn assert_error_code(resp: &Value, code: &str) {
+    assert_eq!(
+        resp.get("success").and_then(Value::as_bool),
+        Some(false),
+        "Expected failure but got: {}",
+        serde_json::to_string_pretty(resp).unwrap_or_default()
+    );
+    assert_eq!(resp.get("code").and_then(Value::as_str), Some(code));
+}
+
 fn native_test_fixture_html(name: &str) -> &'static str {
     match name {
         "drag_probe" => include_str!("test_fixtures/drag_probe.html"),
         "html5_drag_probe" => include_str!("test_fixtures/html5_drag_probe.html"),
         "pointer_capture_probe" => include_str!("test_fixtures/pointer_capture_probe.html"),
+        "snapshot_diff_probe" => include_str!("test_fixtures/snapshot_diff_probe.html"),
         "upload_probe" => include_str!("test_fixtures/upload_probe.html"),
         "memory_probe" => include_str!("test_fixtures/memory_probe.html"),
         "debugger_probe" => include_str!("test_fixtures/debugger_probe.html"),
+        "webmcp_frame_probe" => include_str!("test_fixtures/webmcp_frame_probe.html"),
+        "webmcp_probe" => include_str!("test_fixtures/webmcp_probe.html"),
         _ => panic!("Unknown native test fixture: {}", name),
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_discovery_invocation_and_cancellation() {
+    let (fixture_url, fixture_server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": fixture_url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let child_ready = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let resp = execute_command(
+                &json!({
+                    "id": "2b",
+                    "action": "evaluate",
+                    "script": "document.getElementById('tool-frame')?.contentDocument?.body?.dataset?.webmcpReady === 'true'"
+                }),
+                &mut state,
+            )
+            .await;
+            if get_data(&resp)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        child_ready.is_ok(),
+        "child WebMCP fixture did not become ready"
+    );
+    state.drain_cdp_events_background().await.unwrap();
+
+    let resp = execute_command(&json!({ "id": "3", "action": "webmcp_list" }), &mut state).await;
+    assert_success(&resp);
+    let tools = get_data(&resp)["tools"].as_array().unwrap();
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "set_message")
+        .expect("set_message should be discovered");
+    assert!(tool["frameId"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(tool["origin"]
+        .as_str()
+        .is_some_and(|origin| origin.starts_with("http://127.0.0.1:")));
+    assert_eq!(tool["inputSchema"]["type"], "object");
+    let duplicate_tools = tools
+        .iter()
+        .filter(|tool| tool["name"] == "duplicate_tool")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        duplicate_tools.len(),
+        2,
+        "unexpected tools: {}",
+        serde_json::to_string_pretty(tools).unwrap_or_default()
+    );
+    let main_frame_id = tool["frameId"].as_str().unwrap();
+    let child_frame_id = duplicate_tools
+        .iter()
+        .find_map(|tool| {
+            let frame_id = tool["frameId"].as_str()?;
+            (frame_id != main_frame_id).then_some(frame_id)
+        })
+        .unwrap()
+        .to_string();
+
+    let resp = execute_command(
+        &json!({
+            "id": "3b",
+            "action": "webmcp_invoke",
+            "tool": "duplicate_tool",
+            "params": {}
+        }),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&resp, "webmcp_ambiguous_tool");
+
+    let resp = execute_command(
+        &json!({
+            "id": "3c",
+            "action": "webmcp_invoke",
+            "tool": "duplicate_tool",
+            "frameId": child_frame_id,
+            "params": {},
+            "timeout": 5000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["output"]["scope"], "frame");
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "webmcp_invoke",
+            "tool": "set_message",
+            "params": { "message": "WebMCP works" },
+            "timeout": 5000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "completed");
+    assert_eq!(get_data(&resp)["output"]["message"], "WebMCP works");
+
+    let resp = execute_command(
+        &json!({
+            "id": "4b",
+            "action": "webmcp_invoke",
+            "tool": "fail_tool",
+            "params": {},
+            "timeout": 5000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "failed");
+    assert!(get_data(&resp)["error"].is_string());
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.getElementById('result').textContent"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "WebMCP works");
+
+    let resp = execute_command(
+        &json!({
+            "id": "6",
+            "action": "webmcp_invoke",
+            "tool": "wait_for_cancel",
+            "params": {},
+            "detach": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let invocation_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(get_data(&resp)["status"], "pending");
+    let pending = execute_command(
+        &json!({
+            "id": "6b",
+            "action": "webmcp_result",
+            "invocationId": invocation_id,
+            "timeout": 10
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&pending);
+    assert_eq!(get_data(&pending)["status"], "timed_out");
+
+    let resp = execute_command(
+        &json!({
+            "id": "6c",
+            "action": "webmcp_invoke",
+            "tool": "wait_for_cancel",
+            "params": {},
+            "detach": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let invocation_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    state.drain_cdp_events_background().await.unwrap();
+    assert_eq!(
+        state.webmcp.invocations[&invocation_id].status,
+        "pending",
+        "long-running fixture terminated before cancellation: {}",
+        state.webmcp.invocations[&invocation_id].to_json()
+    );
+
+    let resp = execute_command(
+        &json!({
+            "id": "7",
+            "action": "webmcp_cancel",
+            "invocationId": invocation_id,
+            "timeout": 5000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "canceled");
+
+    let resp = execute_command(
+        &json!({
+            "id": "8",
+            "action": "webmcp_invoke",
+            "tool": "wait_for_cancel",
+            "params": {},
+            "timeout": 25
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "timed_out");
+
+    let resp = execute_command(
+        &json!({
+            "id": "9",
+            "action": "webmcp_invoke",
+            "tool": "missing_tool",
+            "params": {}
+        }),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&resp, "webmcp_tool_not_found");
+
+    let resp = execute_command(
+        &json!({
+            "id": "10",
+            "action": "webmcp_invoke",
+            "tool": "set_message",
+            "params": ["not", "an", "object"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&resp, "webmcp_invalid_input");
+
+    let resp = execute_command(
+        &json!({
+            "id": "11",
+            "action": "webmcp_invoke",
+            "tool": "wait_for_cancel",
+            "params": {},
+            "detach": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let stale_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = execute_command(
+        &json!({
+            "id": "12",
+            "action": "navigate",
+            "url": "about:blank"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "13",
+            "action": "webmcp_result",
+            "invocationId": stale_id,
+            "timeout": 100
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "failed");
+    assert!(get_data(&resp)["error"]
+        .as_str()
+        .is_some_and(|error| error.starts_with("webmcp_context_changed:")));
+
+    let resp = execute_command(
+        &json!({
+            "id": "14",
+            "action": "navigate",
+            "url": fixture_url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "15", "action": "webmcp_list" }), &mut state).await;
+    assert_success(&resp);
+    let frame_id = get_data(&resp)["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "frame_wait")
+        .and_then(|tool| tool["frameId"].as_str())
+        .unwrap()
+        .to_string();
+    let resp = execute_command(
+        &json!({
+            "id": "16",
+            "action": "webmcp_invoke",
+            "tool": "frame_wait",
+            "frameId": frame_id,
+            "params": {},
+            "detach": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let frame_invocation_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = execute_command(
+        &json!({
+            "id": "17",
+            "action": "evaluate",
+            "script": "document.getElementById('tool-frame').remove()"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let resp = execute_command(
+        &json!({
+            "id": "18",
+            "action": "webmcp_result",
+            "invocationId": frame_invocation_id,
+            "timeout": 100
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "failed");
+    assert!(get_data(&resp)["error"]
+        .as_str()
+        .is_some_and(|error| error.starts_with("webmcp_context_changed:")));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    assert!(state.webmcp.invocations.is_empty());
+    fixture_server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_opt_out_returns_no_tools() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "webmcp": false
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "2", "action": "webmcp_list" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["tools"], json!([]));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
 }
 
 #[tokio::test]
@@ -558,7 +960,6 @@ async fn e2e_debugger_second_connection_recovers_paused_first_connection_and_log
         .as_array()
         .is_some_and(|probes| probes.iter().all(|probe| probe["bindings"] == json!([]))));
 }
-
 async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_value: &str) {
     let mut state = DaemonState::new();
 
@@ -4345,7 +4746,11 @@ async fn e2e_diff_snapshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<h1>Hello</h1><p>World</p>" }),
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": native_test_fixture_url("snapshot_diff_probe")
+        }),
         &mut state,
     )
     .await;
@@ -4355,10 +4760,57 @@ async fn e2e_diff_snapshot() {
     let resp = execute_command(&json!({ "id": "3", "action": "snapshot" }), &mut state).await;
     assert_success(&resp);
     let baseline = get_data(&resp)["snapshot"].as_str().unwrap().to_string();
+    assert!(baseline.starts_with("- button \"Primary action\" [ref=e1]"));
+    let baseline_dir = tempfile::tempdir().unwrap();
+    let baseline_path = baseline_dir.path().join("baseline.txt");
+    std::fs::write(&baseline_path, format!("{}\n", baseline)).unwrap();
+
+    // A failed diff must preserve the refs from the last successful snapshot.
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "diff_snapshot",
+            "baseline": baseline_path,
+            "selector": "#missing"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"]
+        .as_str()
+        .unwrap()
+        .contains("did not match any element"));
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "click", "selector": "e1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Repeated diffs must each begin a fresh ref-numbering epoch.
+    for id in ["6", "7"] {
+        let resp = execute_command(
+            &json!({ "id": id, "action": "diff_snapshot", "baseline": baseline_path }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let data = get_data(&resp);
+        assert_eq!(data["changed"], false);
+        assert_eq!(data["additions"], 0);
+        assert_eq!(data["removals"], 0);
+        assert_eq!(data["diff"], "");
+    }
 
     // Modify the page
     let resp = execute_command(
-        &json!({ "id": "4", "action": "evaluate", "script": "document.querySelector('h1').textContent = 'Changed'" }),
+        &json!({
+            "id": "8",
+            "action": "evaluate",
+            "script": "document.querySelector('#primary-action').textContent = 'Updated action'"
+        }),
         &mut state,
     )
     .await;
@@ -4366,13 +4818,116 @@ async fn e2e_diff_snapshot() {
 
     // Diff against baseline
     let resp = execute_command(
-        &json!({ "id": "5", "action": "diff_snapshot", "baseline": baseline }),
+        &json!({ "id": "9", "action": "diff_snapshot", "baseline": baseline_path }),
         &mut state,
     )
     .await;
     assert_success(&resp);
     let data = get_data(&resp);
-    assert_eq!(data["changed"], true, "Diff should detect the h1 change");
+    assert_eq!(
+        data["changed"], true,
+        "Diff should detect the button change"
+    );
+    assert_eq!(data["additions"], 1);
+    assert_eq!(data["removals"], 1);
+    assert!(data["diff"].as_str().unwrap().contains("Updated action"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_diff_url_aligns_refs_after_snapshot() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let stale_url = "data:text/html,<button id='stale-action'>Stale action</button>";
+    let url = native_test_fixture_url("snapshot_diff_probe");
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": stale_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Populate refs that must be invalidated once the URL diff starts navigating.
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "snapshot",
+            "selector": "#stale-action"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.ref_map.get("e1").is_some());
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "diff_url",
+            "url1": url,
+            "url2": "http://[invalid"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(state.ref_map.entries_sorted().is_empty());
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.querySelector('#primary-action')?.textContent"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "Primary action");
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "click", "selector": "e1" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"].as_str().unwrap().contains("Unknown ref: e1"));
+
+    // Populate the session ref map before comparing the same URL to itself.
+    let resp = execute_command(&json!({ "id": "7", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "8",
+            "action": "diff_url",
+            "url1": url,
+            "url2": url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["diff"]["identical"], true);
+    assert_eq!(data["diff"]["changed"], false);
+    assert_eq!(data["diff"]["additions"], 0);
+    assert_eq!(data["diff"]["removals"], 0);
+    assert_eq!(data["snapshot1"], data["snapshot2"]);
+    assert!(data["snapshot1"]
+        .as_str()
+        .unwrap()
+        .starts_with("- button \"Primary action\" [ref=e1]"));
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -5468,6 +6023,36 @@ async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
     (base_url, handle)
 }
 
+async fn start_webmcp_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let request = String::from_utf8_lossy(&buffer);
+                let body = if request.starts_with("GET /frame.html ") {
+                    native_test_fixture_html("webmcp_frame_probe")
+                        .replace("__PORT__", &port.to_string())
+                } else {
+                    native_test_fixture_html("webmcp_probe").replace("__PORT__", &port.to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
 /// Starts a tiny cookie-gated app that behaves like a Next dev target with
 /// cookie-backed login state.
 async fn start_cookie_login_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -6394,6 +6979,814 @@ async fn e2e_relaunch_on_options_change() {
     assert_success(&resp);
 }
 
+// ---------------------------------------------------------------------------
+// Stream: URL events follow active main-frame navigation
+// ---------------------------------------------------------------------------
+
+async fn start_stream_navigation_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stream navigation server should bind");
+    let port = listener
+        .local_addr()
+        .expect("stream navigation server should have an address")
+        .port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let Ok(size) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request_target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let path = request_target.split('?').next().unwrap_or("/");
+                if let Some(destination) = path.strip_prefix("/redirect/") {
+                    let location = format!("/landed/{destination}");
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let body = match path {
+                    "/child" => {
+                        "<!doctype html><title>child</title><p id=\"child\">child</p>"
+                    }
+                    _ => {
+                        "<!doctype html><title>main</title><a id=\"anchor\" href=\"#section\">anchor</a><div id=\"section\">section</div><iframe id=\"child\" src=\"/child\"></iframe>"
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+async fn next_stream_url(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> String {
+    loop {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("stream should emit a URL message")
+            .expect("stream should stay open")
+            .expect("stream message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("message should be text"))
+                .expect("stream payload should be JSON");
+        if payload["type"] == "url" {
+            return payload["url"]
+                .as_str()
+                .expect("URL message should carry a URL")
+                .to_string();
+        }
+    }
+}
+
+async fn expect_no_stream_url(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    duration: tokio::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = tokio::time::timeout(remaining, ws.next()).await;
+        let Ok(Some(Ok(message))) = result else {
+            return;
+        };
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("message should be text"))
+                .expect("stream payload should be JSON");
+        assert_ne!(
+            payload["type"], "url",
+            "unexpected background or child URL: {payload}"
+        );
+    }
+}
+
+async fn next_collected_stream_message(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    iteration: usize,
+    phase: &str,
+) -> Value {
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap_or_else(|_| panic!("stress iteration {iteration} timed out during {phase}"))
+        .unwrap_or_else(|| {
+            panic!("stress iteration {iteration} stream collector stopped during {phase}")
+        })
+}
+
+async fn wait_for_active_stream_tab(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    tab_id: &str,
+    iteration: usize,
+) {
+    loop {
+        let payload =
+            next_collected_stream_message(messages, iteration, "active-tab stream rebind").await;
+        if payload["type"] != "tabs" {
+            continue;
+        }
+        let is_active = payload["tabs"].as_array().is_some_and(|tabs| {
+            tabs.iter()
+                .any(|tab| tab["tabId"] == tab_id && tab["active"].as_bool() == Some(true))
+        });
+        if is_active {
+            return;
+        }
+    }
+}
+
+async fn wait_for_stress_stream_url(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    expected_url: &str,
+    forbidden_marker: &str,
+    iteration: usize,
+) {
+    loop {
+        let payload =
+            next_collected_stream_message(messages, iteration, "active URL convergence").await;
+        if payload["type"] != "url" {
+            continue;
+        }
+        let url = payload["url"]
+            .as_str()
+            .expect("stress URL payload should contain a URL");
+        assert!(
+            !url.contains(forbidden_marker),
+            "stress iteration {iteration} attributed the previous tab URL to the new active tab: {payload}"
+        );
+        if url == expected_url {
+            return;
+        }
+    }
+}
+
+async fn expect_no_forbidden_stream_url(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    forbidden_marker: &str,
+    iteration: usize,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(100);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(payload)) = tokio::time::timeout(remaining, messages.recv()).await else {
+            return;
+        };
+        if payload["type"] != "url" {
+            continue;
+        }
+        let url = payload["url"]
+            .as_str()
+            .expect("stress URL payload should contain a URL");
+        assert!(
+            !url.contains(forbidden_marker),
+            "stress iteration {iteration} emitted a forbidden URL after convergence: {payload}"
+        );
+    }
+}
+
+async fn seeded_stream_tabs(port: u64, iteration: usize) -> Vec<Value> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("stress probe should connect to runtime stream");
+    loop {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("stress iteration {iteration} probe timed out waiting for tabs")
+            })
+            .expect("stress probe stream should stay open")
+            .expect("stress probe message should be valid");
+        if !message.is_text() {
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(message.to_text().expect("probe message should be text"))
+                .expect("probe stream payload should be JSON");
+        if payload["type"] == "tabs" {
+            return payload["tabs"]
+                .as_array()
+                .expect("probe tabs payload should be an array")
+                .clone();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_url_tracks_active_main_frame_navigation_categories() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-url-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-url");
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{base_url}/") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("websocket client should connect to runtime stream");
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await;
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "evaluate",
+            "script": "history.pushState({}, '', '/spa'); location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, format!("{base_url}/spa"));
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "evaluate",
+            "script": "location.hash = 'section'; location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/spa#section")
+    );
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.querySelector('#child').contentWindow.history.pushState({}, '', '/child-spa'); 'done'"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "navigate", "url": format!("{base_url}/full") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, format!("{base_url}/full"));
+
+    let resp = execute_command(
+        &json!({
+            "id": "7",
+            "action": "tab_new",
+            "url": format!("{base_url}/")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let background_session = state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .pages_list()
+        .into_iter()
+        .find(|page| page.tab_id == 2)
+        .expect("background tab should exist")
+        .session_id;
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    while tokio::time::timeout(tokio::time::Duration::from_millis(100), ws.next())
+        .await
+        .is_ok()
+    {}
+
+    let resp = execute_command(
+        &json!({
+            "id": "9",
+            "action": "evaluate",
+            "script": "history.pushState({}, '', '/after-switch'); location.href"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/after-switch")
+    );
+
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Page.navigate",
+            Some(json!({ "url": format!("{base_url}/background-full") })),
+            Some(&background_session),
+        )
+        .await
+        .expect("background tab should navigate");
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": format!("{base_url}/external") })),
+            None,
+        )
+        .await
+        .expect("external tab should open");
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let resp = execute_command(&json!({ "id": "10", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["url"], format!("{base_url}/external"));
+
+    let external_session = state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .active_session_id()
+        .expect("external tab should become active")
+        .to_string();
+    state
+        .browser
+        .as_ref()
+        .expect("browser should exist")
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": "history.pushState({}, '', '/external-spa'); location.href"
+            })),
+            Some(&external_session),
+        )
+        .await
+        .expect("external tab should navigate within its document");
+    assert_eq!(
+        next_stream_url(&mut ws).await,
+        format!("{base_url}/external-spa")
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_lightpanda_stream_url_tracks_active_full_navigation() {
+    let lightpanda_bin = match std::env::var("LIGHTPANDA_BIN") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return,
+    };
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-lightpanda-stream-url-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-lightpanda-stream-url");
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "lp-stream", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = tokio::time::timeout(
+        tokio::time::Duration::from_secs(20),
+        execute_command(
+            &json!({
+                "id": "lp-launch",
+                "action": "launch",
+                "headless": true,
+                "engine": "lightpanda",
+                "executablePath": lightpanda_bin
+            }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("Lightpanda stream launch should not hang");
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "lp-initial",
+            "action": "navigate",
+            "url": format!("{base_url}/lp-initial")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("Lightpanda stream client should connect");
+    while tokio::time::timeout(tokio::time::Duration::from_millis(100), ws.next())
+        .await
+        .is_ok()
+    {}
+
+    let active_before_background = format!("{base_url}/lp-active-before-background");
+    let resp = execute_command(
+        &json!({
+            "id": "lp-active-before",
+            "action": "navigate",
+            "url": active_before_background
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, active_before_background);
+
+    let resp = execute_command(
+        &json!({
+            "id": "lp-child-navigation",
+            "action": "evaluate",
+            "script": "document.querySelector('#child').src = '/lp-forbidden-child'; 'done'"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    expect_no_stream_url(&mut ws, tokio::time::Duration::from_millis(500)).await;
+
+    let tabs = seeded_stream_tabs(port, 0).await;
+    let active = tabs
+        .iter()
+        .find(|tab| tab["active"].as_bool() == Some(true))
+        .expect("Lightpanda reconnect should seed an active tab");
+    assert_eq!(active["tabId"], "t1");
+    assert_eq!(active["url"], active_before_background);
+
+    let final_url = format!("{base_url}/lp-active-final");
+    let resp = execute_command(
+        &json!({
+            "id": "lp-active-final",
+            "action": "navigate",
+            "url": final_url
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(next_stream_url(&mut ws).await, final_url);
+
+    let resp = execute_command(&json!({ "id": "lp-close", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_url_survives_real_world_navigation_stress() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-url-stress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-url-stress");
+
+    let iterations = std::env::var("AGENT_BROWSER_STRESS_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40);
+    let mut seed = std::env::var("AGENT_BROWSER_STRESS_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1677);
+
+    let (base_url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "stress-stream", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let resp = execute_command(
+        &json!({
+            "id": "stress-tab-a",
+            "action": "navigate",
+            "url": format!("{base_url}/app-a")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "stress-tab-b",
+            "action": "tab_new",
+            "url": format!("{base_url}/app-b")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let pages = state
+        .browser
+        .as_ref()
+        .expect("stress browser should exist")
+        .pages_list();
+    let session_a = pages
+        .iter()
+        .find(|page| page.tab_id == 1)
+        .expect("stress tab A should exist")
+        .session_id
+        .clone();
+    let session_b = pages
+        .iter()
+        .find(|page| page.tab_id == 2)
+        .expect("stress tab B should exist")
+        .session_id
+        .clone();
+    let client = Arc::clone(
+        &state
+            .browser
+            .as_ref()
+            .expect("stress browser should exist")
+            .client,
+    );
+
+    let (fast_ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("stress collector should connect to runtime stream");
+    let (message_tx, mut messages) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let collector = tokio::spawn(async move {
+        let mut ws = fast_ws;
+        while let Some(Ok(message)) = ws.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(
+                message.to_text().expect("collector message should be text"),
+            ) else {
+                continue;
+            };
+            if message_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    wait_for_active_stream_tab(&mut messages, "t2", 0).await;
+
+    let (mut slow_ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("slow stress client should connect to runtime stream");
+
+    let mut active_tab = "t2";
+    for iteration in 0..iterations {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let delay_ms = 1 + (seed % 12);
+        let target_tab = if active_tab == "t1" { "t2" } else { "t1" };
+        let old_session = if active_tab == "t1" {
+            session_a.clone()
+        } else {
+            session_b.clone()
+        };
+        let forbidden_marker = format!("forbidden-{iteration}");
+        let same_document_path = format!("/{forbidden_marker}-old-spa");
+        let redirect_url = format!("{base_url}/redirect/{forbidden_marker}-old-full");
+
+        let late_client = Arc::clone(&client);
+        let late_session = old_session.clone();
+        let late_same_document_path = same_document_path.clone();
+        let late_child_marker = forbidden_marker.clone();
+        let late_same_document = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            let expression = format!(
+                "history.pushState({{}}, '', {}); const child = document.querySelector('#child'); if (child?.contentWindow) child.contentWindow.history.pushState({{}}, '', '/{late_child_marker}-old-child'); location.href",
+                serde_json::to_string(&late_same_document_path)
+                    .expect("stress path should serialize")
+            );
+            late_client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({ "expression": expression })),
+                    Some(&late_session),
+                )
+                .await
+        });
+
+        let redirect_client = Arc::clone(&client);
+        let redirect_session = old_session.clone();
+        let late_redirect = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms + 1)).await;
+            redirect_client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({ "url": redirect_url })),
+                    Some(&redirect_session),
+                )
+                .await
+        });
+
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-switch-{iteration}"),
+                "action": "tab_switch",
+                "tabId": target_tab
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        wait_for_active_stream_tab(&mut messages, target_tab, iteration).await;
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), late_same_document)
+            .await
+            .unwrap_or_else(|_| panic!("stress iteration {iteration} late SPA task timed out"))
+            .expect("late SPA task should join")
+            .expect("late SPA CDP command should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), late_redirect)
+            .await
+            .unwrap_or_else(|_| panic!("stress iteration {iteration} late redirect task timed out"))
+            .expect("late redirect task should join")
+            .expect("late redirect CDP command should succeed");
+
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-child-{iteration}"),
+                "action": "evaluate",
+                "script": format!(
+                    "const child = document.querySelector('#child'); if (!child?.contentWindow) throw new Error('missing stress iframe'); child.contentWindow.history.pushState({{}}, '', '/{forbidden_marker}-active-child'); 'done'"
+                )
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+
+        let expected_url = format!("{base_url}/{target_tab}-active-{iteration}");
+        let resp = execute_command(
+            &json!({
+                "id": format!("stress-active-{iteration}"),
+                "action": "evaluate",
+                "script": format!(
+                    "history.replaceState({{}}, '', {}); location.href",
+                    serde_json::to_string(&expected_url).expect("stress URL should serialize")
+                )
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        wait_for_stress_stream_url(&mut messages, &expected_url, &forbidden_marker, iteration)
+            .await;
+
+        let resp = execute_command(
+            &json!({ "id": format!("stress-url-{iteration}"), "action": "url" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(
+            get_data(&resp)["url"],
+            expected_url,
+            "stress iteration {iteration} active browser URL diverged"
+        );
+        expect_no_forbidden_stream_url(&mut messages, &forbidden_marker, iteration).await;
+
+        if iteration % 5 == 0 {
+            let tabs = seeded_stream_tabs(port, iteration).await;
+            let active = tabs
+                .iter()
+                .find(|tab| tab["active"].as_bool() == Some(true))
+                .unwrap_or_else(|| {
+                    panic!("stress iteration {iteration} reconnect had no active tab")
+                });
+            assert_eq!(
+                active["tabId"], target_tab,
+                "stress iteration {iteration} reconnect seeded the wrong active tab"
+            );
+            assert_eq!(
+                active["url"], expected_url,
+                "stress iteration {iteration} reconnect seeded a stale URL"
+            );
+        }
+
+        if iteration % 7 == 6 {
+            drop(slow_ws);
+            let (replacement, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+                    .await
+                    .expect("replacement slow stress client should connect");
+            slow_ws = replacement;
+        }
+
+        active_tab = target_tab;
+    }
+
+    drop(slow_ws);
+    collector.abort();
+    let resp = execute_command(
+        &json!({ "id": "stress-close", "action": "close" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+// ---------------------------------------------------------------------------
 /// A follow-up launch request may repeat one option while omitting the rest.
 /// Omitted options inherit the active browser configuration so commands such
 /// as screenshot and URL reads do not destroy the page opened by the caller.
@@ -6452,7 +7845,6 @@ async fn e2e_partial_launch_preserves_open_page() {
     assert_success(&resp);
 }
 
-// ---------------------------------------------------------------------------
 // Stream: custom viewport is reflected in screencast frame metadata
 // ---------------------------------------------------------------------------
 
