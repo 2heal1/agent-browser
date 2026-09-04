@@ -2,6 +2,35 @@
 
 Use network commands to intercept requests, mock responses, inspect traffic, and export HAR files during browser automation.
 
+## Network throttling
+
+```bash
+agent-browser open
+agent-browser set network-throttling --latency-ms 150 --download-kbps 1600 --upload-kbps 750
+agent-browser navigate https://app.example.com
+agent-browser set offline on
+agent-browser set offline off
+agent-browser set network-throttling reset
+```
+
+<table>
+  <thead>
+    <tr><th>Option</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>--latency-ms &lt;number&gt;</code></td><td>Adds non-negative minimum request latency in milliseconds</td></tr>
+    <tr><td><code>--download-kbps &lt;number&gt;</code></td><td>Limits aggregate download throughput using decimal kilobits per second</td></tr>
+    <tr><td><code>--upload-kbps &lt;number&gt;</code></td><td>Limits aggregate upload throughput using decimal kilobits per second</td></tr>
+    <tr><td><code>reset</code></td><td>Restores online mode, zero added latency, and unlimited throughput</td></tr>
+  </tbody>
+</table>
+
+Omitted options preserve their current values. Offline mode uses the same effective configuration, so turning it on does not discard limits and turning it off restores them. Settings persist across reload and navigation and are applied to new tabs, popups, cross-origin iframes, and supported attached worker targets.
+
+Network throttling requires Chromium CDP. It uses `Network.emulateNetworkConditionsByRule` and `Network.overrideNetworkState` when supported and falls back to the deprecated aggregate API only when the modern method is unavailable. General HTTP/TCP packet loss and random jitter are outside this feature and require a proxy or operating-system network layer. CDP packet loss controls only WebRTC traffic.
+
+Action policy and confirmation files can gate these settings with the `network_throttling`, `cpu_throttling`, and `offline` action names.
+
 ## Request routing
 
 Routes apply before matching requests are sent. Set them before navigation when you need the first page load to be affected.

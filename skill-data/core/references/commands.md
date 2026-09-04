@@ -168,11 +168,17 @@ agent-browser set viewport 1920 1080 2        # 2x retina (same CSS size, higher
 agent-browser set device "iPhone 14"          # Emulate device
 agent-browser set geo 37.7749 -122.4194       # Set geolocation (alias: geolocation)
 agent-browser set offline on                  # Toggle offline mode
+agent-browser set cpu-throttling 4            # CPU slowdown factor (>= 1)
+agent-browser set cpu-throttling reset        # Restore normal CPU speed
+agent-browser set network-throttling --latency-ms 150 --download-kbps 1600 --upload-kbps 750
+agent-browser set network-throttling reset    # Restore normal network
 agent-browser set headers '{"X-Key":"v"}'     # Extra HTTP headers
 agent-browser set credentials user pass       # HTTP basic auth (alias: auth)
 agent-browser set media dark                  # Emulate color scheme
 agent-browser set media light reduced-motion  # Light mode + reduced motion
 ```
+
+Network throughput uses decimal kbps. Omitted network fields preserve their current values. Offline mode preserves configured limits and restores them when switched off. Throttling requires Chromium CDP and is reapplied to navigation, tabs, popups, and cross-origin iframe targets. CPU throttling is a renderer slowdown only, not full low-end device emulation.
 
 ## Cookies and Storage
 
@@ -377,12 +383,12 @@ The default tools profile is `core`, which keeps MCP context small for everyday 
 Profiles:
 
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
-- `network` - Network routes, request inspection, HAR, headers, credentials, offline
+- `network` - Network routes, request inspection, HAR, headers, credentials, offline, network throttling
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` - Compiled JavaScript breakpoints, logpoints, pause recovery, WebMCP list/call, console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `mobile` - Viewport/device/geolocation/media and CPU throttling, plus touch, swipe, mouse, keyboard
 - `all` - Every MCP tool, including the full typed CLI parity surface
 
 Common tools include:
