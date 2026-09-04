@@ -2467,6 +2467,9 @@ fn skip_launch_action(action: &str) -> bool {
             | "stream_disable"
             | "stream_status"
             | "session_info"
+            | "webmcp_list"
+            | "webmcp_invoke"
+            | "webmcp_call"
             | "webmcp_result"
             | "webmcp_cancel"
             | "memory_status"
@@ -13855,6 +13858,31 @@ mod tests {
             .unwrap()
             .contains("Browser not launched"));
         assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_webmcp_page_commands_do_not_auto_launch_blank_browser() {
+        for action in ["webmcp_list", "webmcp_invoke", "webmcp_call"] {
+            assert!(skip_launch_action(action));
+        }
+
+        for cmd in [
+            json!({ "action": "webmcp_list", "id": "webmcp-list" }),
+            json!({
+                "action": "webmcp_invoke",
+                "id": "webmcp-invoke",
+                "toolName": "search",
+                "params": {}
+            }),
+        ] {
+            let mut state = DaemonState::new();
+
+            let resp = execute_command(&cmd, &mut state).await;
+
+            assert_eq!(resp["success"], false);
+            assert!(resp["error"].is_string());
+            assert!(state.browser.is_none());
+        }
     }
 
     #[tokio::test]
