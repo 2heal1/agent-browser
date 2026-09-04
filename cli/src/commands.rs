@@ -3793,6 +3793,8 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         "geo",
         "geolocation",
         "offline",
+        "cpu-throttling",
+        "network-throttling",
         "headers",
         "credentials",
         "auth",
@@ -3870,6 +3872,102 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 .unwrap_or(true);
             Ok(json!({ "id": id, "action": "offline", "offline": off }))
         }
+        Some("cpu-throttling") => {
+            const USAGE: &str = "set cpu-throttling <rate|reset>";
+            let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "set cpu-throttling".to_string(),
+                usage: USAGE,
+            })?;
+            if rest.len() != 2 {
+                return Err(ParseError::InvalidValue {
+                    message: "set cpu-throttling accepts exactly one rate or reset".to_string(),
+                    usage: USAGE,
+                });
+            }
+            if *value == "reset" {
+                return Ok(json!({ "id": id, "action": "cpu_throttling", "reset": true }));
+            }
+            let rate = value
+                .parse::<f64>()
+                .ok()
+                .filter(|rate| rate.is_finite() && *rate >= 1.0)
+                .ok_or_else(|| ParseError::InvalidValue {
+                    message: format!(
+                        "CPU throttling rate must be a finite number greater than or equal to 1, got '{}'",
+                        value
+                    ),
+                    usage: USAGE,
+                })?;
+            Ok(json!({ "id": id, "action": "cpu_throttling", "rate": rate }))
+        }
+        Some("network-throttling") => {
+            const USAGE: &str = "set network-throttling [--latency-ms <number>] [--download-kbps <number>] [--upload-kbps <number>]\n  or: set network-throttling reset";
+            if rest.get(1) == Some(&"reset") {
+                if rest.len() != 2 {
+                    return Err(ParseError::InvalidValue {
+                        message: "network throttling reset does not accept other arguments"
+                            .to_string(),
+                        usage: USAGE,
+                    });
+                }
+                return Ok(
+                    json!({ "id": id, "action": "network_throttling", "reset": true }),
+                );
+            }
+
+            let mut cmd = json!({ "id": id, "action": "network_throttling" });
+            let mut index = 1;
+            let mut provided = false;
+            while index < rest.len() {
+                let (flag, field) = match rest[index] {
+                    "--latency-ms" => ("--latency-ms", "latencyMs"),
+                    "--download-kbps" => ("--download-kbps", "downloadKbps"),
+                    "--upload-kbps" => ("--upload-kbps", "uploadKbps"),
+                    value => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!(
+                                "Unknown network throttling argument '{}'",
+                                value
+                            ),
+                            usage: USAGE,
+                        })
+                    }
+                };
+                let raw = rest
+                    .get(index + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("set network-throttling {}", flag),
+                        usage: USAGE,
+                    })?;
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| ParseError::InvalidValue {
+                        message: format!(
+                            "{} must be a finite non-negative number, got '{}'",
+                            flag, raw
+                        ),
+                        usage: USAGE,
+                    })?;
+                if cmd.get(field).is_some() {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("{} may only be specified once", flag),
+                        usage: USAGE,
+                    });
+                }
+                cmd[field] = json!(value);
+                provided = true;
+                index += 2;
+            }
+            if !provided {
+                return Err(ParseError::MissingArguments {
+                    context: "set network-throttling".to_string(),
+                    usage: USAGE,
+                });
+            }
+            Ok(cmd)
+        }
         Some("headers") => {
             let headers_json = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "set headers".to_string(),
@@ -3917,7 +4015,7 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         }),
         None => Err(ParseError::MissingArguments {
             context: "set".to_string(),
-            usage: "set <viewport|device|geo|offline|headers|credentials|media> [args...]",
+            usage: "set <viewport|device|geo|offline|cpu-throttling|network-throttling|headers|credentials|media> [args...]",
         }),
     }
 }
@@ -5062,6 +5160,72 @@ mod tests {
         ];
         let result = parse_command(&input, &default_flags());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_cpu_throttling_rate_and_reset() {
+        let rate = parse_command(&args("set cpu-throttling 4"), &default_flags()).unwrap();
+        assert_eq!(rate["action"], "cpu_throttling");
+        assert_eq!(rate["rate"], 4.0);
+
+        let reset = parse_command(&args("set cpu-throttling reset"), &default_flags()).unwrap();
+        assert_eq!(reset["action"], "cpu_throttling");
+        assert_eq!(reset["reset"], true);
+    }
+
+    #[test]
+    fn test_set_cpu_throttling_rejects_invalid_rates() {
+        for value in ["0", "0.5", "-1", "NaN", "inf"] {
+            assert!(
+                parse_command(
+                    &args(&format!("set cpu-throttling {}", value)),
+                    &default_flags()
+                )
+                .is_err(),
+                "accepted invalid rate {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_network_throttling_parses_partial_update_and_reset() {
+        let update = parse_command(
+            &args("set network-throttling --latency-ms 150 --download-kbps 1600 --upload-kbps 750"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(update["action"], "network_throttling");
+        assert_eq!(update["latencyMs"], 150.0);
+        assert_eq!(update["downloadKbps"], 1600.0);
+        assert_eq!(update["uploadKbps"], 750.0);
+
+        let partial = parse_command(
+            &args("set network-throttling --download-kbps 800"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(partial["downloadKbps"], 800.0);
+        assert!(partial.get("latencyMs").is_none());
+
+        let reset = parse_command(&args("set network-throttling reset"), &default_flags()).unwrap();
+        assert_eq!(reset["reset"], true);
+    }
+
+    #[test]
+    fn test_set_network_throttling_rejects_invalid_arguments() {
+        for command in [
+            "set network-throttling",
+            "set network-throttling --latency-ms -1",
+            "set network-throttling --download-kbps NaN",
+            "set network-throttling --upload-kbps",
+            "set network-throttling --unknown 1",
+            "set network-throttling reset --latency-ms 1",
+        ] {
+            assert!(
+                parse_command(&args(command), &default_flags()).is_err(),
+                "accepted invalid command {command}"
+            );
+        }
     }
 
     #[test]

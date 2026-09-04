@@ -450,6 +450,395 @@ async fn e2e_webmcp_opt_out_returns_no_tools() {
     assert_success(&resp);
 }
 
+async fn evaluate_elapsed(state: &mut DaemonState, id: &str, script: &str) -> f64 {
+    let response = execute_command(
+        &json!({ "id": id, "action": "evaluate", "script": script }),
+        state,
+    )
+    .await;
+    assert_success(&response);
+    get_data(&response)["result"].as_f64().unwrap()
+}
+
+const CPU_PROBE_SCRIPT: &str = "(() => { const start = performance.now(); let value = 0; for (let i = 0; i < 20000000; i++) value += Math.sqrt((i % 997) + 1); globalThis.__cpuProbe = value; return performance.now() - start; })()";
+
+fn run_e2e_with_large_stack<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name("throttling-e2e".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test());
+        })
+        .unwrap();
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+#[ignore]
+fn e2e_cpu_and_network_throttling_observable_and_resettable() {
+    run_e2e_with_large_stack(run_cpu_and_network_throttling_observable_and_resettable);
+}
+
+async fn run_cpu_and_network_throttling_observable_and_resettable() {
+    let (base_url, _other_url, servers) = start_throttling_servers().await;
+    let mut state = DaemonState::new();
+    let launch = execute_command(
+        &json!({ "id": "throttle-1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&launch);
+    let pre_navigation_throttle = execute_command(
+        &json!({
+            "id": "throttle-1a",
+            "action": "network_throttling",
+            "latencyMs": 150
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&pre_navigation_throttle);
+    let navigation_started = std::time::Instant::now();
+    let navigate = execute_command(
+        &json!({ "id": "throttle-2", "action": "navigate", "url": base_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&navigate);
+    assert!(
+        navigation_started.elapsed() >= std::time::Duration::from_millis(110),
+        "network throttling was not applied before the first real navigation"
+    );
+
+    let _ = evaluate_elapsed(&mut state, "throttle-3", CPU_PROBE_SCRIPT).await;
+    let cpu_baseline = evaluate_elapsed(&mut state, "throttle-4", CPU_PROBE_SCRIPT).await;
+    let cpu_set = execute_command(
+        &json!({ "id": "throttle-5", "action": "cpu_throttling", "rate": 4 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&cpu_set);
+    assert_eq!(get_data(&cpu_set)["rate"], 4.0);
+    let cpu_slow = evaluate_elapsed(&mut state, "throttle-6", CPU_PROBE_SCRIPT).await;
+    assert!(
+        cpu_slow >= cpu_baseline * 2.2,
+        "4x CPU throttling was not observable: baseline={cpu_baseline}ms throttled={cpu_slow}ms"
+    );
+
+    let cpu_reset = execute_command(
+        &json!({ "id": "throttle-7", "action": "cpu_throttling", "reset": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&cpu_reset);
+    assert_eq!(get_data(&cpu_reset)["rate"], 1.0);
+    let cpu_recovered = evaluate_elapsed(&mut state, "throttle-8", CPU_PROBE_SCRIPT).await;
+    assert!(
+        cpu_recovered < cpu_slow * 0.7,
+        "CPU reset did not recover: throttled={cpu_slow}ms reset={cpu_recovered}ms"
+    );
+
+    let network_set = execute_command(
+        &json!({
+            "id": "throttle-9",
+            "action": "network_throttling",
+            "downloadKbps": 800,
+            "uploadKbps": 800
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&network_set);
+    assert_eq!(get_data(&network_set)["latencyMs"], 150.0);
+    let latency = evaluate_elapsed(
+        &mut state,
+        "throttle-10",
+        "(async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        latency >= 110.0,
+        "configured latency was not observed: {latency}ms"
+    );
+
+    let download = evaluate_elapsed(
+        &mut state,
+        "throttle-11",
+        "(async () => { const start = performance.now(); const response = await fetch('/payload?' + Math.random(), {cache:'no-store'}); await response.arrayBuffer(); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        download >= 700.0,
+        "800 kbps download limit was not observed: {download}ms"
+    );
+    let upload = evaluate_elapsed(
+        &mut state,
+        "throttle-12",
+        "(async () => { const body = new Uint8Array(100000); const start = performance.now(); await fetch('/upload?' + Math.random(), {method:'POST', body, cache:'no-store'}); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        upload >= 700.0,
+        "800 kbps upload limit was not observed: {upload}ms"
+    );
+
+    let reload = execute_command(
+        &json!({ "id": "throttle-13", "action": "reload" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&reload);
+    let after_reload = evaluate_elapsed(
+        &mut state,
+        "throttle-14",
+        "(async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        after_reload >= 110.0,
+        "network latency did not persist across reload: {after_reload}ms"
+    );
+
+    let offline = execute_command(
+        &json!({ "id": "throttle-15", "action": "offline", "offline": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&offline);
+    assert_eq!(get_data(&offline)["offline"], true);
+    assert_eq!(get_data(&offline)["latencyMs"], 150.0);
+    assert_eq!(get_data(&offline)["downloadKbps"], 800.0);
+    let online = execute_command(
+        &json!({ "id": "throttle-16", "action": "offline", "offline": false }),
+        &mut state,
+    )
+    .await;
+    assert_success(&online);
+    assert_eq!(get_data(&online)["offline"], false);
+    assert_eq!(get_data(&online)["latencyMs"], 150.0);
+
+    let network_reset = execute_command(
+        &json!({ "id": "throttle-17", "action": "network_throttling", "reset": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&network_reset);
+    assert_eq!(get_data(&network_reset)["offline"], false);
+    assert_eq!(get_data(&network_reset)["latencyMs"], 0.0);
+    assert_eq!(get_data(&network_reset)["downloadKbps"], Value::Null);
+    let recovered_download = evaluate_elapsed(
+        &mut state,
+        "throttle-18",
+        "(async () => { const start = performance.now(); const response = await fetch('/payload?' + Math.random(), {cache:'no-store'}); await response.arrayBuffer(); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        recovered_download < download * 0.6,
+        "network reset did not restore throughput: throttled={download}ms reset={recovered_download}ms"
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "id": "throttle-19",
+                "action": "network_throttling",
+                "downloadKbps": 800
+            }),
+            &mut state,
+        )
+        .await,
+    );
+    let reapplied_download = evaluate_elapsed(
+        &mut state,
+        "throttle-20",
+        "(async () => { const start = performance.now(); const response = await fetch('/payload?' + Math.random(), {cache:'no-store'}); await response.arrayBuffer(); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(
+        reapplied_download >= 600.0,
+        "network throttling could not be reapplied after reset: {reapplied_download}ms"
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "throttle-21", "action": "network_throttling", "reset": true }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let _ = execute_command(
+        &json!({ "id": "throttle-99", "action": "close" }),
+        &mut state,
+    )
+    .await;
+    for server in servers {
+        server.abort();
+    }
+}
+
+#[test]
+#[ignore]
+fn e2e_throttling_reapplies_to_tabs_popups_and_cross_origin_iframes() {
+    run_e2e_with_large_stack(run_throttling_reapplies_to_tabs_popups_and_cross_origin_iframes);
+}
+
+async fn run_throttling_reapplies_to_tabs_popups_and_cross_origin_iframes() {
+    let (base_url, other_url, servers) = start_throttling_servers().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "target-1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "target-2", "action": "navigate", "url": base_url }),
+            &mut state,
+        )
+        .await,
+    );
+    let _ = evaluate_elapsed(&mut state, "target-3", CPU_PROBE_SCRIPT).await;
+    let baseline = evaluate_elapsed(&mut state, "target-4", CPU_PROBE_SCRIPT).await;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "target-5", "action": "cpu_throttling", "rate": 4 }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "id": "target-6",
+                "action": "network_throttling",
+                "latencyMs": 120
+            }),
+            &mut state,
+        )
+        .await,
+    );
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "target-7", "action": "tab_new", "url": base_url }),
+            &mut state,
+        )
+        .await,
+    );
+    let tab_cpu = evaluate_elapsed(&mut state, "target-8", CPU_PROBE_SCRIPT).await;
+    assert!(tab_cpu >= baseline * 2.2);
+    let tab_latency = evaluate_elapsed(
+        &mut state,
+        "target-9",
+        "(async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(tab_latency >= 85.0);
+    let worker_latency = evaluate_elapsed(
+        &mut state,
+        "target-9a",
+        "new Promise((resolve, reject) => { const worker = new Worker('/worker.js?' + Math.random()); worker.onmessage = event => { worker.terminate(); resolve(event.data); }; worker.onerror = event => reject(event.message); worker.postMessage('run'); })",
+    )
+    .await;
+    assert!(
+        worker_latency >= 85.0,
+        "network throttling was not applied to the worker target: {worker_latency}ms"
+    );
+
+    let popup = execute_command(
+        &json!({
+            "id": "target-10",
+            "action": "evaluate",
+            "script": format!("window.open({}); true", serde_json::to_string(&other_url).unwrap())
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&popup);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    state.drain_cdp_events_background().await.unwrap();
+    let popup_latency = evaluate_elapsed(
+        &mut state,
+        "target-11",
+        "(async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); return performance.now() - start; })()",
+    )
+    .await;
+    assert!(popup_latency >= 85.0);
+
+    let parent_url = format!(
+        "{base_url}/parent?frame={}",
+        urlencoding::encode(&other_url)
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "target-12", "action": "navigate", "url": parent_url }),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            state.drain_cdp_events_background().await.unwrap();
+            if !state.active_iframe_sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cross-origin iframe did not attach");
+    let iframe_session = state.active_iframe_sessions.iter().next().unwrap().clone();
+    let manager = state.browser.as_ref().unwrap();
+    let iframe_cpu = manager
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": CPU_PROBE_SCRIPT,
+                "returnByValue": true,
+                "awaitPromise": true
+            })),
+            Some(&iframe_session),
+        )
+        .await
+        .unwrap()["result"]["value"]
+        .as_f64()
+        .unwrap();
+    assert!(iframe_cpu >= baseline * 2.2);
+    let iframe_latency = manager
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": "(async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); return performance.now() - start; })()",
+                "returnByValue": true,
+                "awaitPromise": true
+            })),
+            Some(&iframe_session),
+        )
+        .await
+        .unwrap()["result"]["value"]
+        .as_f64()
+        .unwrap();
+    assert!(iframe_latency >= 85.0);
+
+    let _ = execute_command(&json!({ "id": "target-99", "action": "close" }), &mut state).await;
+    for server in servers {
+        server.abort();
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_memory_metrics_sampling_snapshot_and_tab_binding() {
@@ -6021,6 +6410,108 @@ async fn start_echo_server() -> (String, tokio::task::JoinHandle<()>) {
     });
 
     (base_url, handle)
+}
+
+async fn serve_throttling_listener(
+    listener: tokio::net::TcpListener,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        break (header_end, content_length);
+                    }
+                    if request.len() > 1_000_000 {
+                        return;
+                    }
+                };
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+
+                let request_text = String::from_utf8_lossy(&request[..header_end]);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, body) = if path.starts_with("/payload") {
+                    ("application/octet-stream", vec![b'x'; 100_000])
+                } else if path.starts_with("/worker.js") {
+                    (
+                        "application/javascript",
+                        b"self.onmessage = async () => { const start = performance.now(); await fetch('/tiny?' + Math.random(), {cache:'no-store'}); self.postMessage(performance.now() - start); };".to_vec(),
+                    )
+                } else if path.starts_with("/upload") || path.starts_with("/tiny") {
+                    ("text/plain", b"ok".to_vec())
+                } else if path.starts_with("/parent") {
+                    let frame = path
+                        .split_once("frame=")
+                        .and_then(|(_, value)| urlencoding::decode(value).ok())
+                        .map(|value| value.into_owned())
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    (
+                        "text/html",
+                        format!(
+                            "<!doctype html><title>throttle parent</title><iframe id=\"probe-frame\" src=\"{frame}\"></iframe>"
+                        )
+                        .into_bytes(),
+                    )
+                } else {
+                    (
+                        "text/html",
+                        b"<!doctype html><title>throttle probe</title>".to_vec(),
+                    )
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.flush().await;
+            });
+        }
+    })
+}
+
+async fn start_throttling_servers() -> (String, String, Vec<tokio::task::JoinHandle<()>>) {
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_url = format!("http://127.0.0.1:{}", first.local_addr().unwrap().port());
+    let second_url = format!("http://localhost:{}", second.local_addr().unwrap().port());
+    let first_handle = serve_throttling_listener(first).await;
+    let second_handle = serve_throttling_listener(second).await;
+    (first_url, second_url, vec![first_handle, second_handle])
 }
 
 async fn start_webmcp_server() -> (String, tokio::task::JoinHandle<()>) {

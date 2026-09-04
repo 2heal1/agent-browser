@@ -76,6 +76,8 @@ const TOOL_SET_VIEWPORT: &str = "agent_browser_set_viewport";
 const TOOL_SET_DEVICE: &str = "agent_browser_set_device";
 const TOOL_SET_GEO: &str = "agent_browser_set_geo";
 const TOOL_SET_OFFLINE: &str = "agent_browser_set_offline";
+const TOOL_SET_CPU_THROTTLING: &str = "agent_browser_set_cpu_throttling";
+const TOOL_SET_NETWORK_THROTTLING: &str = "agent_browser_set_network_throttling";
 const TOOL_SET_HEADERS: &str = "agent_browser_set_headers";
 const TOOL_SET_CREDENTIALS: &str = "agent_browser_set_credentials";
 const TOOL_SET_MEDIA: &str = "agent_browser_set_media";
@@ -288,12 +290,12 @@ impl ToolProfile {
     fn description(self) -> &'static str {
         match self {
             Self::Core => "Everyday browser automation with navigation, snapshots, common interaction, waits, screenshots, basic reads, tab basics, JavaScript eval, close, and profile discovery.",
-            Self::Network => "Network interception, request inspection, HAR capture, headers, credentials, and offline mode.",
+            Self::Network => "Network interception, request inspection, HAR capture, headers, credentials, offline mode, and network throttling.",
             Self::State => "Cookies, storage, auth profiles, saved browser state, sessions, Chrome profiles, and bundled skills.",
             Self::Debug => "Compiled JavaScript breakpoints, logpoints and pause recovery, plus console/errors, highlighting, DevTools, tracing, profiling, memory diagnostics, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
             Self::Tabs => "Tab, window, frame, and JavaScript dialog management.",
             Self::React => "React tree inspection, render recording, Suspense inspection, Web Vitals, SPA pushstate, and init-script removal.",
-            Self::Mobile => "Viewport/device/geolocation/media emulation plus touch, swipe, and lower-level mouse tools.",
+            Self::Mobile => "Viewport/device/geolocation/media and CPU throttling, plus touch, swipe, and lower-level mouse tools.",
             Self::Webmcp => "Experimental page-provided WebMCP discovery, invocation, detached results, and cancellation.",
             Self::All => "Every MCP tool, including the full typed CLI parity surface.",
         }
@@ -404,6 +406,7 @@ const NETWORK_PROFILE_TOOLS: &[&str] = &[
     TOOL_SET_HEADERS,
     TOOL_SET_CREDENTIALS,
     TOOL_SET_OFFLINE,
+    TOOL_SET_NETWORK_THROTTLING,
     TOOL_NETWORK_ROUTE,
     TOOL_NETWORK_UNROUTE,
     TOOL_NETWORK_REQUESTS,
@@ -552,6 +555,7 @@ const MOBILE_PROFILE_TOOLS: &[&str] = &[
     TOOL_SET_DEVICE,
     TOOL_SET_GEO,
     TOOL_SET_MEDIA,
+    TOOL_SET_CPU_THROTTLING,
     TOOL_TAP,
     TOOL_SWIPE,
     TOOL_DEVICE,
@@ -1215,6 +1219,40 @@ fn parity_tools() -> Vec<Value> {
             "Toggle offline mode.",
             json!({ "enabled": { "type": "boolean" } }),
             &["enabled"],
+        ),
+        tool(
+            TOOL_SET_CPU_THROTTLING,
+            "Set CPU throttling",
+            "Set the Chromium CPU slowdown factor, or reset it to normal.",
+            json!({
+                "rate": {
+                    "type": "number",
+                    "minimum": 1,
+                    "description": "CPU slowdown factor. Use 1 for normal speed."
+                },
+                "reset": { "type": "boolean" }
+            }),
+            &[],
+        ),
+        tool(
+            TOOL_SET_NETWORK_THROTTLING,
+            "Set network throttling",
+            "Update Chromium network latency and throughput limits, or reset all network conditions.",
+            json!({
+                "latencyMs": { "type": "number", "minimum": 0 },
+                "downloadKbps": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Decimal kilobits per second."
+                },
+                "uploadKbps": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Decimal kilobits per second."
+                },
+                "reset": { "type": "boolean" }
+            }),
+            &[],
         ),
         tool(
             TOOL_SET_HEADERS,
@@ -2522,6 +2560,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_SET_DEVICE => call_one_string(arguments, "set device", "device"),
         TOOL_SET_GEO => call_set_geo(arguments),
         TOOL_SET_OFFLINE => call_set_bool(arguments, "offline", "enabled"),
+        TOOL_SET_CPU_THROTTLING => call_set_cpu_throttling(arguments),
+        TOOL_SET_NETWORK_THROTTLING => call_set_network_throttling(arguments),
         TOOL_SET_HEADERS => call_set_headers(arguments),
         TOOL_SET_CREDENTIALS => call_set_credentials(arguments),
         TOOL_SET_MEDIA => call_set_media(arguments),
@@ -3185,6 +3225,90 @@ fn call_set_bool(arguments: &Value, setting: &str, key: &str) -> Result<Value, P
         ],
         None,
     )
+}
+
+fn optional_bounded_number_string(
+    arguments: &Value,
+    key: &str,
+    minimum: f64,
+) -> Result<Option<String>, ProtocolError> {
+    let Some(value) = optional_value(arguments, key)? else {
+        return Ok(None);
+    };
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite() && *number >= minimum)
+        .ok_or_else(|| {
+            ProtocolError::invalid_params(format!(
+                "{} must be a finite number greater than or equal to {}",
+                key, minimum
+            ))
+        })?;
+    Ok(Some(number.to_string()))
+}
+
+fn call_set_cpu_throttling(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, set_cpu_throttling_args(arguments)?, None)
+}
+
+fn set_cpu_throttling_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let reset = optional_bool(arguments, "reset")?.unwrap_or(false);
+    let rate = optional_bounded_number_string(arguments, "rate", 1.0)?;
+    if reset && rate.is_some() {
+        return Err(ProtocolError::invalid_params(
+            "reset cannot be combined with rate",
+        ));
+    }
+    let value = if reset {
+        "reset".to_string()
+    } else {
+        rate.ok_or_else(|| ProtocolError::invalid_params("rate or reset is required"))?
+    };
+    Ok(vec!["set".to_string(), "cpu-throttling".to_string(), value])
+}
+
+fn call_set_network_throttling(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, set_network_throttling_args(arguments)?, None)
+}
+
+fn set_network_throttling_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let reset = optional_bool(arguments, "reset")?.unwrap_or(false);
+    let values = [
+        (
+            "--latency-ms",
+            optional_bounded_number_string(arguments, "latencyMs", 0.0)?,
+        ),
+        (
+            "--download-kbps",
+            optional_bounded_number_string(arguments, "downloadKbps", 0.0)?,
+        ),
+        (
+            "--upload-kbps",
+            optional_bounded_number_string(arguments, "uploadKbps", 0.0)?,
+        ),
+    ];
+    if reset && values.iter().any(|(_, value)| value.is_some()) {
+        return Err(ProtocolError::invalid_params(
+            "reset cannot be combined with network throttling values",
+        ));
+    }
+    let mut args = vec!["set".to_string(), "network-throttling".to_string()];
+    if reset {
+        args.push("reset".to_string());
+    } else {
+        for (flag, value) in values {
+            if let Some(value) = value {
+                args.push(flag.to_string());
+                args.push(value);
+            }
+        }
+        if args.len() == 2 {
+            return Err(ProtocolError::invalid_params(
+                "at least one network throttling value or reset is required",
+            ));
+        }
+    }
+    Ok(args)
 }
 
 fn call_set_headers(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -5052,6 +5176,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["set", "media", "dark", "reduced-motion"]);
+    }
+
+    #[test]
+    fn throttling_args_match_cli_contract() {
+        assert_eq!(
+            set_cpu_throttling_args(&json!({ "rate": 4 })).unwrap(),
+            vec!["set", "cpu-throttling", "4"]
+        );
+        assert_eq!(
+            set_cpu_throttling_args(&json!({ "reset": true })).unwrap(),
+            vec!["set", "cpu-throttling", "reset"]
+        );
+        assert_eq!(
+            set_network_throttling_args(&json!({
+                "latencyMs": 150,
+                "downloadKbps": 1600,
+                "uploadKbps": 750
+            }))
+            .unwrap(),
+            vec![
+                "set",
+                "network-throttling",
+                "--latency-ms",
+                "150",
+                "--download-kbps",
+                "1600",
+                "--upload-kbps",
+                "750"
+            ]
+        );
+        assert_eq!(
+            set_network_throttling_args(&json!({ "reset": true })).unwrap(),
+            vec!["set", "network-throttling", "reset"]
+        );
+    }
+
+    #[test]
+    fn throttling_args_reject_conflicts_and_invalid_values() {
+        assert!(set_cpu_throttling_args(&json!({})).is_err());
+        assert!(set_cpu_throttling_args(&json!({ "rate": 0.5 })).is_err());
+        assert!(set_cpu_throttling_args(&json!({ "rate": 2, "reset": true })).is_err());
+        assert!(set_network_throttling_args(&json!({})).is_err());
+        assert!(set_network_throttling_args(&json!({ "latencyMs": -1 })).is_err());
+        assert!(set_network_throttling_args(&json!({
+            "downloadKbps": 100,
+            "reset": true
+        }))
+        .is_err());
     }
 
     #[test]

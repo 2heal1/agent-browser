@@ -381,6 +381,19 @@ agent-browser dialog accept "text"    # accept with prompt input
 agent-browser dialog dismiss          # cancel
 ```
 
+## Simulating slower CPU and network conditions
+
+Use Chromium CDP throttling before the first real navigation when reproducing slow-device or slow-network behavior:
+
+```bash
+agent-browser open
+agent-browser set cpu-throttling 4
+agent-browser set network-throttling --latency-ms 150 --download-kbps 1600 --upload-kbps 750
+agent-browser goto http://localhost:3000
+```
+
+CPU values are slowdown factors of `1` or greater. Network values use decimal kbps, and omitted fields preserve their current values. Offline mode preserves configured network limits. Use `set cpu-throttling reset` and `set network-throttling reset` to restore normal behavior. CPU throttling affects page and iframe renderers but does not simulate memory, GPU, disk, core count, or thermal limits. See [references/commands.md](references/commands.md#browser-settings) for target coverage and network-layer limitations.
+
 ## Capturing page memory evidence
 
 Use the Chrome-only `memory` commands when a page appears to retain JavaScript objects or DOM nodes across a repeatable flow. They reuse the current browser session and do not need a separate CDP address.
