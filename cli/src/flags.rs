@@ -8,6 +8,55 @@ use std::path::{Path, PathBuf};
 const CONFIG_FILENAME: &str = "config.json";
 const PROJECT_CONFIG_FILENAME: &str = "agent-browser.json";
 
+/// Parse browser launch arguments from `--args` or `AGENT_BROWSER_ARGS`.
+///
+/// Arguments are split on newlines, and on commas only when the next token
+/// starts a `--` flag (for backward compatibility with legacy comma-separated
+/// switch lists such as `--no-sandbox,--disable-gpu`). Commas inside switch
+/// values such as `--disable-features=A,B` or `--window-position=-32000,-32000`
+/// are preserved intact.
+pub fn parse_browser_args(raw: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut start = 0;
+        let bytes = line.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] == b',' && line[idx + 1..].trim_start().starts_with("--") {
+                let token = line[start..idx].trim();
+                if !token.is_empty() {
+                    result.push(token.to_string());
+                }
+                start = idx + 1;
+            }
+            idx += 1;
+        }
+        let tail = line[start..].trim();
+        if !tail.is_empty() {
+            result.push(tail.to_string());
+        }
+    }
+    result
+}
+
+fn append_cli_browser_args(flags: &mut Flags, value: &str) {
+    flags.args = Some(match flags.args.take() {
+        Some(existing) if flags.cli_args && !existing.trim().is_empty() => {
+            if value.trim().is_empty() {
+                existing
+            } else {
+                format!("{}\n{}", existing, value)
+            }
+        }
+        _ => value.to_string(),
+    });
+    flags.cli_args = true;
+}
+
 /// Parse idle timeout from user-friendly format.
 /// Supports: "10s" (seconds), "3m" (minutes), "1h" (hours), or raw milliseconds.
 fn parse_idle_timeout(s: &str) -> Result<String, String> {
@@ -939,10 +988,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            s if s.starts_with("--args=") => {
+                append_cli_browser_args(&mut flags, s.trim_start_matches("--args="));
+            }
             "--args" => {
                 if let Some(s) = args.get(i + 1) {
-                    flags.args = Some(s.clone());
-                    flags.cli_args = true;
+                    append_cli_browser_args(&mut flags, s);
                     i += 1;
                 }
             }
@@ -1262,7 +1313,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             i += 1;
             continue;
         }
-        if arg.starts_with("--restore=") {
+        if arg.starts_with("--restore=") || arg.starts_with("--args=") {
             i += 1;
             continue;
         }
@@ -2337,5 +2388,47 @@ mod tests {
             clean_args(&args("--no-webmcp open example.com")),
             args("open example.com")
         );
+    }
+
+    #[test]
+    fn test_parse_browser_args_preserves_commas_in_flag_values() {
+        assert_eq!(
+            parse_browser_args(
+                "--disable-features=Translate,KeychainKeyProviderUserDataDirProtection"
+            ),
+            vec!["--disable-features=Translate,KeychainKeyProviderUserDataDirProtection"]
+        );
+        assert_eq!(
+            parse_browser_args("--window-position=-32000,-32000\n--no-sandbox"),
+            vec!["--window-position=-32000,-32000", "--no-sandbox"]
+        );
+        assert_eq!(
+            parse_browser_args("--disable-features=A,B,--start-maximized"),
+            vec!["--disable-features=A,B", "--start-maximized"]
+        );
+        assert_eq!(
+            parse_browser_args("--no-sandbox, --disable-gpu\nabout:blank"),
+            vec!["--no-sandbox", "--disable-gpu", "about:blank"]
+        );
+    }
+
+    #[test]
+    fn test_parse_args_repeatable_and_equals_form() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ARGS"]);
+        guard.set("AGENT_BROWSER_ARGS", "--from-env");
+        let input = vec![
+            "--args".to_string(),
+            "--disable-features=A,B".to_string(),
+            "--args=--window-position=-100,-200".to_string(),
+            "open".to_string(),
+            "example.com".to_string(),
+        ];
+        let flags = parse_flags(&input);
+        assert!(flags.cli_args);
+        assert_eq!(
+            flags.args.as_deref(),
+            Some("--disable-features=A,B\n--window-position=-100,-200")
+        );
+        assert_eq!(clean_args(&input), vec!["open", "example.com"]);
     }
 }

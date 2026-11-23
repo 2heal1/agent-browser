@@ -1979,12 +1979,7 @@ fn main() {
         }
 
         if let Some(ref a) = flags.args {
-            // Parse args (comma or newline separated)
-            let args_vec: Vec<String> = a
-                .split(&[',', '\n'][..])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let args_vec = flags::parse_browser_args(a);
             cmd_obj.insert("args".to_string(), json!(args_vec));
         }
 
