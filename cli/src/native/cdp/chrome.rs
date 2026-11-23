@@ -421,8 +421,9 @@ struct ChromeArgs {
 }
 
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
-    // Chrome only honors the last --enable-features switch on the command
-    // line, so every feature must be collected into a single flag.
+    // Chrome only honors the last --enable-features and --disable-features
+    // switches on the command line, so every feature must be collected into a
+    // single flag.
     let mut enable_features: Vec<String> = vec![
         "NetworkService".to_string(),
         "NetworkServiceInProcess".to_string(),
@@ -435,17 +436,31 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         enable_features.push("Vulkan".to_string());
     }
 
-    // User-supplied --enable-features values are merged into that single
-    // flag too: appending them as a second switch would silently clobber
-    // the preset's features (e.g. drop the WebGPU preset's Vulkan). To turn
-    // a preset feature off, pass --disable-features=<name>, which Chrome
-    // resolves as disabled.
+    let mut disable_features: Vec<String> = vec!["Translate".to_string()];
+    // Chrome 158+ on macOS enables KeychainKeyProviderUserDataDirProtection by
+    // default, which rejects v10 keychain-encrypted cookies when running out of
+    // a copied non-default user-data-dir.
+    #[cfg(target_os = "macos")]
+    if options.use_real_keychain {
+        disable_features.push("KeychainKeyProviderUserDataDirProtection".to_string());
+    }
+
+    // User-supplied --enable-features and --disable-features values are merged
+    // into those single flags too: appending them as a second switch would
+    // silently clobber the preset's features (e.g. drop WebGPU Vulkan or
+    // macOS KeychainKeyProviderUserDataDirProtection).
     let mut user_args: Vec<String> = Vec::new();
     for arg in &options.args {
         if let Some(values) = arg.strip_prefix("--enable-features=") {
             for feature in values.split(',').map(str::trim).filter(|f| !f.is_empty()) {
                 if !enable_features.iter().any(|f| f == feature) {
                     enable_features.push(feature.to_string());
+                }
+            }
+        } else if let Some(values) = arg.strip_prefix("--disable-features=") {
+            for feature in values.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                if !disable_features.iter().any(|f| f == feature) {
+                    disable_features.push(feature.to_string());
                 }
             }
         } else {
@@ -465,7 +480,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--disable-popup-blocking".to_string(),
         "--disable-prompt-on-repost".to_string(),
         "--disable-sync".to_string(),
-        "--disable-features=Translate".to_string(),
+        format!("--disable-features={}", disable_features.join(",")),
         format!("--enable-features={}", enable_features.join(",")),
         "--metrics-recording-only".to_string(),
     ];
@@ -702,27 +717,12 @@ fn terminate_launched_chrome(child: &mut Child) {
 }
 
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
-    let chrome_path = match &options.executable_path {
-        Some(p) => PathBuf::from(p),
-        None => find_chrome_for_mode(options.effectively_headless()).ok_or_else(|| {
-            let cache_dir = crate::install::get_browsers_dir();
-            format!(
-                "Chrome not found. Checked:\n  \
-                 - agent-browser cache: {}\n  \
-                 - System Chrome installations\n  \
-                 - Puppeteer browser cache\n  \
-                 - Playwright browser cache\n\
-                 Run `agent-browser install` to download Chrome, or use --executable-path.",
-                cache_dir.display()
-            )
-        })?,
-    };
-
     // Profile name preprocessing: if --profile is a Chrome profile name (not a
     // path), resolve it to a directory, copy the profile to a temp dir, and
     // rewrite options so the retry loop uses the copied profile.
     let mut resolved_options: Option<LaunchOptions> = None;
     let mut profile_temp_dir: Option<PathBuf> = None;
+    let mut matched_profile_user_data_dir: Option<PathBuf> = None;
 
     if let Some(ref profile) = options.profile {
         if is_chrome_profile_name(profile) {
@@ -739,11 +739,38 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
             opts.use_real_keychain = true;
             opts.args.push(format!("--profile-directory={}", resolved));
             profile_temp_dir = Some(temp_path);
+            matched_profile_user_data_dir = Some(user_data_dir);
             resolved_options = Some(opts);
         }
     }
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
+
+    // When reusing a system Chrome profile, prefer the matching system browser
+    // binary over downloaded Chrome for Testing so macOS Keychain Safe Storage
+    // items match the profile's encrypted cookies.
+    let chrome_path = match &effective_options.executable_path {
+        Some(p) => PathBuf::from(p),
+        None => matched_profile_user_data_dir
+            .as_deref()
+            .and_then(find_chrome_for_user_data_dir)
+            .or_else(|| find_chrome_for_mode(effective_options.effectively_headless()))
+            .ok_or_else(|| {
+                if let Some(ref dir) = profile_temp_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                let cache_dir = crate::install::get_browsers_dir();
+                format!(
+                    "Chrome not found. Checked:\n  \
+                     - agent-browser cache: {}\n  \
+                     - System Chrome installations\n  \
+                     - Puppeteer browser cache\n  \
+                     - Playwright browser cache\n\
+                     Run `agent-browser install` to download Chrome, or use --executable-path.",
+                    cache_dir.display()
+                )
+            })?,
+    };
 
     let max_attempts = 3;
     let mut last_err = String::new();
@@ -1029,6 +1056,89 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
 
 pub fn find_chrome() -> Option<PathBuf> {
     find_chrome_for_mode(true)
+}
+
+fn system_chrome_candidates_for_user_data_dir(user_data_dir: &Path) -> Vec<PathBuf> {
+    let normalized = user_data_dir.to_string_lossy().replace('\\', "/");
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if normalized.ends_with("Google/Chrome Canary") {
+            candidates.push(PathBuf::from(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            ));
+        } else if normalized.ends_with("Google/Chrome") {
+            candidates.push(PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ));
+        } else if normalized.ends_with("/Chromium") {
+            candidates.push(PathBuf::from(
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ));
+        } else if normalized.ends_with("BraveSoftware/Brave-Browser") {
+            candidates.push(PathBuf::from(
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let names: &[&str] = if normalized.ends_with("/google-chrome-unstable") {
+            &["google-chrome-unstable"]
+        } else if normalized.ends_with("/google-chrome") {
+            &["google-chrome", "google-chrome-stable"]
+        } else if normalized.ends_with("/chromium") {
+            &["chromium-browser", "chromium"]
+        } else if normalized.ends_with("BraveSoftware/Brave-Browser") {
+            &["brave-browser", "brave-browser-stable"]
+        } else {
+            &[]
+        };
+        for name in names {
+            if let Ok(output) = Command::new("which").arg(name).output() {
+                if !output.status.success() {
+                    continue;
+                }
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    candidates.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if normalized.ends_with("Google/Chrome/User Data") {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                candidates
+                    .push(PathBuf::from(&local).join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            candidates.push(PathBuf::from(
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            ));
+            candidates.push(PathBuf::from(
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ));
+        } else if normalized.ends_with("BraveSoftware/Brave-Browser/User Data") {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                candidates.push(
+                    PathBuf::from(&local)
+                        .join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+                );
+            }
+        }
+    }
+
+    candidates
+}
+
+fn find_chrome_for_user_data_dir(user_data_dir: &Path) -> Option<PathBuf> {
+    system_chrome_candidates_for_user_data_dir(user_data_dir)
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 fn find_chrome_for_mode(allow_headless_shell: bool) -> Option<PathBuf> {
@@ -1404,6 +1514,7 @@ const PROFILE_COPY_EXCLUDE_DIRS: &[&str] = &[
     "Code Cache",
     "GPUCache",
     "Service Worker",
+    "Sessions",
     "blob_storage",
     "File System",
     "GCM Store",
@@ -2707,9 +2818,97 @@ mod tests {
             !result.args.iter().any(|a| a == "--use-mock-keychain"),
             "should NOT have --use-mock-keychain when use_real_keychain is true"
         );
+        let disable_flags: Vec<&String> = result
+            .args
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(disable_flags.len(), 1);
+        let disabled: Vec<&str> = disable_flags[0]
+            .strip_prefix("--disable-features=")
+            .unwrap()
+            .split(',')
+            .collect();
+        assert!(disabled.contains(&"Translate"));
+        if cfg!(target_os = "macos") {
+            assert!(
+                disabled.contains(&"KeychainKeyProviderUserDataDirProtection"),
+                "copied macOS Chrome profiles must disable KeychainKeyProviderUserDataDirProtection"
+            );
+        }
         if let Some(ref dir) = result.temp_user_data_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn test_build_args_merges_user_disable_features() {
+        let opts = LaunchOptions {
+            use_real_keychain: true,
+            args: vec![
+                "--disable-features=Foo,Bar".to_string(),
+                "--some-other-flag".to_string(),
+                "--disable-features=Translate,Foo".to_string(),
+            ],
+            ..Default::default()
+        };
+        let result = build_chrome_args(&opts).unwrap();
+        let flags: Vec<&String> = result
+            .args
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(
+            flags.len(),
+            1,
+            "user --disable-features must merge, not clobber"
+        );
+        let features: Vec<&str> = flags[0]
+            .strip_prefix("--disable-features=")
+            .unwrap()
+            .split(',')
+            .collect();
+        assert!(features.contains(&"Translate"));
+        assert!(features.contains(&"Foo"));
+        assert!(features.contains(&"Bar"));
+        if cfg!(target_os = "macos") {
+            assert!(features.contains(&"KeychainKeyProviderUserDataDirProtection"));
+        }
+        assert_eq!(features.iter().filter(|f| **f == "Translate").count(), 1);
+        assert_eq!(features.iter().filter(|f| **f == "Foo").count(), 1);
+        assert!(result.args.iter().any(|a| a == "--some-other-flag"));
+        if let Some(ref dir) = result.temp_user_data_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_system_chrome_candidates_for_macos_user_data_dir() {
+        assert_eq!(
+            system_chrome_candidates_for_user_data_dir(Path::new(
+                "/Users/test/Library/Application Support/Google/Chrome"
+            )),
+            vec![PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )]
+        );
+        assert_eq!(
+            system_chrome_candidates_for_user_data_dir(Path::new(
+                "/Users/test/Library/Application Support/Google/Chrome Canary"
+            )),
+            vec![PathBuf::from(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+            )]
+        );
+        assert_eq!(
+            system_chrome_candidates_for_user_data_dir(Path::new(
+                "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser"
+            )),
+            vec![PathBuf::from(
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+            )]
+        );
     }
 
     #[test]
